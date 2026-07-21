@@ -220,7 +220,19 @@ fn spawn_codex() -> Result<(Child, String), String> {
     candidates.extend([
         "/opt/homebrew/bin/codex".into(),
         "/usr/local/bin/codex".into(),
+        "/Applications/ChatGPT.app/Contents/Resources/codex".into(),
+        "/Applications/Codex.app/Contents/Resources/codex".into(),
     ]);
+    #[cfg(target_os = "macos")]
+    if let Ok(home) = env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() {
+            candidates.extend([
+                format!("{home}/Applications/ChatGPT.app/Contents/Resources/codex"),
+                format!("{home}/Applications/Codex.app/Contents/Resources/codex"),
+            ]);
+        }
+    }
 
     let mut last_error = String::new();
     for program in candidates {
@@ -238,7 +250,7 @@ fn spawn_codex() -> Result<(Child, String), String> {
     #[cfg(target_os = "windows")]
     let help = "Codex Desktop 的 WindowsApps 内置程序不能作为外部 CLI 调用；请安装独立 Codex CLI 并登录，或把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
     #[cfg(not(target_os = "windows"))]
-    let help = "请安装 Codex CLI 并登录，或把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
+    let help = "请安装新版 ChatGPT/Codex 桌面程序或独立 Codex CLI 并登录，也可以把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
 
     Err(format!("无法启动 Codex CLI（{last_error}）。{help}。"))
 }

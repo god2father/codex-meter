@@ -62,8 +62,8 @@ initialize
 
 ## 运行要求
 
-- 已安装并登录 Codex CLI。
-- 终端中可以正常运行 `codex --version`。
+- 已有可用的 Codex 登录：macOS 可使用新版 ChatGPT/Codex 桌面程序内置版本；其他情况需让终端可以正常运行 `codex --version`。
+- macOS 会自动识别 `/Applications/ChatGPT.app`、旧版 `/Applications/Codex.app` 及用户应用目录中的内置 Codex，无需额外配置。
 - Windows 需要 WebView2；Windows 10/11 通常已预装。
 
 如果 Codex CLI 不在系统路径中，可以通过环境变量指定：

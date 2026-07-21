@@ -1,0 +1,111 @@
+name: 发布已有构建到 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release 标签，例如 v0.1.0
+        required: true
+        default: v0.1.0
+      run_id:
+        description: 已成功完成打包的 Actions 运行 ID
+        required: true
+        default: "29808142011"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  release:
+    name: 创建 GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载 Windows 构建
+        uses: actions/download-artifact@v4
+        with:
+          name: Codex-Meter-Windows-x64
+          path: artifacts/windows
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: 下载 Apple Silicon 构建
+        uses: actions/download-artifact@v4
+        with:
+          name: Codex-Meter-macOS-Apple-Silicon
+          path: artifacts/mac-arm
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: 下载 Intel Mac 构建
+        uses: actions/download-artifact@v4
+        with:
+          name: Codex-Meter-macOS-Intel
+          path: artifacts/mac-intel
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.run_id }}
+
+      - name: 整理发布附件
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p release-assets
+
+          windows_portable="$(find artifacts/windows -type f -name 'codex-meter.exe' -print -quit)"
+          windows_setup="$(find artifacts/windows -type f -name '*setup.exe' -print -quit)"
+          mac_arm_dmg="$(find artifacts/mac-arm -type f -name '*.dmg' -print -quit)"
+          mac_intel_dmg="$(find artifacts/mac-intel -type f -name '*.dmg' -print -quit)"
+
+          test -n "$windows_portable"
+          test -n "$windows_setup"
+          test -n "$mac_arm_dmg"
+          test -n "$mac_intel_dmg"
+
+          cp "$windows_portable" "release-assets/Codex-Meter_${version}_Windows-x64-portable.exe"
+          cp "$windows_setup" "release-assets/Codex-Meter_${version}_Windows-x64-setup.exe"
+          cp "$mac_arm_dmg" "release-assets/Codex-Meter_${version}_macOS-Apple-Silicon.dmg"
+          cp "$mac_intel_dmg" "release-assets/Codex-Meter_${version}_macOS-Intel.dmg"
+
+          test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4
+          ls -lh release-assets
+
+      - name: 创建或更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -euo pipefail
+          target_sha="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq '.head_sha')"
+
+          cat > release-notes.md <<'EOF'
+          Codex Meter 首个跨平台公开版本。
+
+          ### 下载说明
+
+          - Windows：推荐下载 `Windows-x64-setup.exe`；便携使用可下载 `Windows-x64-portable.exe`
+          - Apple Silicon Mac：下载 `macOS-Apple-Silicon.dmg`
+          - Intel Mac：下载 `macOS-Intel.dmg`
+
+          ### 主要功能
+
+          - 在 Windows 任务栏或 macOS 菜单栏显示 Codex 剩余用量
+          - 圆环进度与数字托盘图标
+          - 轻薄半透明玻璃气泡面板
+          - 自动适配系统浅色与深色模式
+          - macOS 自动识别 ChatGPT/Codex 桌面程序内置 Codex
+          - 支持独立 Codex CLI 与自动回退
+
+          > 当前安装包尚未进行 Windows/macOS 开发者签名，首次运行时系统可能显示安全提示。
+          EOF
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" release-assets/*               --repo "$GITHUB_REPOSITORY"               --target "$target_sha"               --title "Codex Meter $TAG"               --notes-file release-notes.md
+          fi

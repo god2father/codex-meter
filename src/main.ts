@@ -17,6 +17,7 @@ interface UsageSnapshot {
   primary: LimitWindow | null;
   secondary?: LimitWindow | null;
   creditsBalance?: number | null;
+  resetCreditsAvailable?: number | null;
   status: UsageStatus;
   fetchedAt: number;
   error?: string | null;
@@ -52,6 +53,7 @@ const mockSnapshot: UsageSnapshot = {
     resetsAt: Math.floor(Date.now() / 1000) + 4.2 * 24 * 60 * 60,
   },
   creditsBalance: null,
+  resetCreditsAvailable: 2,
   status: "ok",
   fetchedAt: Math.floor(Date.now() / 1000),
 };
@@ -135,6 +137,17 @@ function tightestWindow(data: UsageSnapshot): LimitWindow | null {
 
 function remainingOf(item: LimitWindow): number {
   return clampPercent(100 - item.usedPercent);
+}
+
+function usageQuip(remaining: number): string {
+  if (remaining >= 90) return "额度富得流油，今天可以放肆写。";
+  if (remaining >= 75) return "钱包鼓鼓，Codex 还能继续加班。";
+  if (remaining >= 55) return "粮草充足，放心把需求往里倒。";
+  if (remaining >= 35) return "进入正常消耗区，暂时不用抠门。";
+  if (remaining >= 20) return "额度开始喘气，需求尽量一次说清。";
+  if (remaining >= 10) return "Codex 在看表了，长任务请三思。";
+  if (remaining > 0) return "只剩最后几口，省着点薅它。";
+  return "额度已躺平，等重置后再卷。";
 }
 
 function statusCopy(): { label: string; detail: string } {
@@ -237,7 +250,8 @@ function render(): void {
           <div class="summary">
             <span>当前可用</span>
             <strong>${formatWindow(tightest!.windowDurationMins)}窗口</strong>
-            <small>${data.planType ? `${formatPlan(data.planType)} 计划` : "当前账户"}</small>
+            <small>${data.planType ? `${formatPlan(data.planType)} 计划` : "当前账户"}${data.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</small>
+            <p class="usage-quip">${usageQuip(remaining)}</p>
           </div>
         </div>
         <div class="limits" aria-label="用量窗口">

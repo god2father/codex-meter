@@ -9,7 +9,7 @@ Codex Meter 是一款面向 Windows 系统托盘和 macOS 菜单栏的轻量 Cod
 | 平台 | 状态 | 产物 |
 | --- | --- | --- |
 | Windows 10/11 | 已完成首个可验证版本 | `codex-meter.exe` |
-| macOS | 源码兼容，由 GitHub Actions 构建，尚未真机验收 | `.app` / `.dmg`（未签名） |
+| macOS | 由 GitHub Actions 构建，等待真机验收 | `.app` / `.dmg`（ad-hoc 签名） |
 
 Windows 版本已验证生产构建、单实例、右键菜单、深色模式、窄尺寸布局和基础交互。macOS 仍需在真实 Mac 上验证菜单栏定位、Retina 缩放、Vibrancy 效果和应用签名。
 
@@ -19,6 +19,8 @@ Windows 版本已验证生产构建、单实例、右键菜单、深色模式、
 - 托盘图标使用圆环进度和剩余百分比数字。
 - 自动选择剩余比例更低的窗口作为托盘主状态。
 - 展示本地时区下的额度重置时间。
+- 接口支持时展示账户当前可用的额度重置次数。
+- 根据剩余用量显示不同的轻松提示文案。
 - 自动识别 Plus、Pro、Team、Business 等套餐名称。
 - 每分钟自动刷新，也可手动立即刷新。
 - 刷新失败时保留最后一次成功结果并标记为旧数据。
@@ -106,7 +108,7 @@ npm ci
 npm run tauri -- build --bundles app,dmg
 ```
 
-未签名的 macOS 应用可能被 Gatekeeper 拦截。用于公开分发时，需要配置 Apple Developer 证书、公证和 Stapling。
+测试版使用 ad-hoc 签名，避免 Apple Silicon 将下载包直接判定为损坏；首次打开仍可能需要在“隐私与安全性”中允许。用于公开分发时，仍建议配置 Apple Developer 证书、公证和 Stapling。
 
 ## GitHub Actions 自动打包
 

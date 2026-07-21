@@ -1,5 +1,7 @@
 use serde::Serialize;
 use serde_json::{json, Value};
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::{
     env,
     io::{BufRead, BufReader, Write},
@@ -10,6 +12,8 @@ use std::{
 };
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct CodexService {
     client: Option<RpcClient>,
@@ -72,13 +76,16 @@ impl RpcClient {
     }
 
     fn connect_to(program: &str) -> Result<Self, String> {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(["app-server", "--listen", "stdio://"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|error| error.to_string())?;
+            .stderr(Stdio::null());
+        #[cfg(target_os = "windows")]
+        command.creation_flags(CREATE_NO_WINDOW);
+
+        let mut child = command.spawn().map_err(|error| error.to_string())?;
         let stdin = child
             .stdin
             .take()
@@ -149,6 +156,7 @@ impl RpcClient {
         }
 
         let response = self.request("account/rateLimits/read", json!({}))?;
+        let reset_credits_available = available_reset_credits(&response);
         let limits = response.get("rateLimits").unwrap_or(&response);
         let plan_type = preferred_plan_type(limits, account_plan_type);
         let primary = limits.get("primary").and_then(UsageWindow::from_value);
@@ -181,6 +189,7 @@ impl RpcClient {
             primary,
             secondary,
             credits_balance,
+            reset_credits_available,
             status: status.into(),
             fetched_at: unix_seconds(),
             error: None,
@@ -272,6 +281,7 @@ pub struct UsageSnapshot {
     pub primary: Option<UsageWindow>,
     pub secondary: Option<UsageWindow>,
     pub credits_balance: Option<f64>,
+    pub reset_credits_available: Option<i64>,
     pub status: String,
     pub fetched_at: i64,
     pub error: Option<String>,
@@ -285,6 +295,7 @@ impl UsageSnapshot {
             primary: None,
             secondary: None,
             credits_balance: None,
+            reset_credits_available: None,
             status: "unavailable".into(),
             fetched_at: unix_seconds(),
             error: Some(error),
@@ -302,6 +313,7 @@ impl UsageSnapshot {
             primary: None,
             secondary: None,
             credits_balance: None,
+            reset_credits_available: None,
             status: status.into(),
             fetched_at: unix_seconds(),
             error: None,
@@ -355,6 +367,14 @@ fn preferred_plan_type(limits: &Value, account_plan_type: Option<String>) -> Opt
         .or(account_plan_type)
 }
 
+fn available_reset_credits(response: &Value) -> Option<i64> {
+    response
+        .pointer("/rateLimitResetCredits/availableCount")
+        .or_else(|| response.pointer("/rate_limit_reset_credits/available_count"))
+        .and_then(Value::as_i64)
+        .map(|count| count.max(0))
+}
+
 fn unix_seconds() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -393,5 +413,15 @@ mod tests {
         let plan = preferred_plan_type(&json!({ "planType": "plus" }), Some("free".into()));
 
         assert_eq!(plan.as_deref(), Some("plus"));
+    }
+
+    #[test]
+    fn reads_available_reset_credits_from_rate_limit_response() {
+        let response = json!({
+            "rateLimits": { "planType": "plus" },
+            "rateLimitResetCredits": { "availableCount": 3 }
+        });
+
+        assert_eq!(available_reset_credits(&response), Some(3));
     }
 }

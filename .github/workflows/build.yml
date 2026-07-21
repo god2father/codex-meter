@@ -8,7 +8,7 @@ on:
       - "**/*.md"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: codex-meter-build-${{ github.ref }}
@@ -121,3 +121,36 @@ jobs:
             src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app/**
             src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
 
+  release:
+    name: 发布 GitHub Release v0.1.1
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.event.head_commit.message == 'publish release v0.1.1'
+
+    steps:
+      - name: 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Codex-Meter-*
+          path: release-assets
+
+      - name: 创建 Release 并上传安装包
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.1
+          name: Codex Meter v0.1.1
+          target_commitish: ${{ github.sha }}
+          make_latest: true
+          fail_on_unmatched_files: true
+          body: |
+            Codex Meter v0.1.1 首个公开安装包。
+
+            下载说明：
+            - Windows x64：下载 NSIS setup 安装程序
+            - macOS Apple Silicon：适用于 M1/M2/M3/M4 芯片
+            - macOS Intel：适用于 Intel 芯片 Mac
+
+            注意：macOS 应用目前未进行 Apple Developer 公证，首次打开时可能需要在“系统设置 → 隐私与安全性”中允许运行。
+          files: |
+            release-assets/**/*.exe
+            release-assets/**/*.dmg

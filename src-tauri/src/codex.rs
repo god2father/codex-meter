@@ -55,7 +55,30 @@ struct RpcClient {
 
 impl RpcClient {
     fn connect() -> Result<Self, String> {
-        let (mut child, program) = spawn_codex()?;
+        let mut last_error = String::new();
+        for program in codex_candidates() {
+            match Self::connect_to(&program) {
+                Ok(client) => return Ok(client),
+                Err(error) => last_error = format!("{program}: {error}"),
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        let help = "Codex Desktop 的 WindowsApps 内置程序不能作为外部 CLI 调用；请安装独立 Codex CLI 并登录，或把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
+        #[cfg(not(target_os = "windows"))]
+        let help = "请安装新版 ChatGPT/Codex 桌面程序或独立 Codex CLI 并登录，也可以把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
+
+        Err(format!("无法启动 Codex CLI（{last_error}）。{help}。"))
+    }
+
+    fn connect_to(program: &str) -> Result<Self, String> {
+        let mut child = Command::new(program)
+            .args(["app-server", "--listen", "stdio://"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| error.to_string())?;
         let stdin = child
             .stdin
             .take()
@@ -93,7 +116,7 @@ impl RpcClient {
                     }
                 }),
             )
-            .map_err(|error| format!("Could not initialize {program}: {error}"))?;
+            .map_err(|error| format!("Could not initialize: {error}"))?;
         client.notify("initialized", json!({}))?;
         Ok(client)
     }
@@ -205,21 +228,15 @@ impl Drop for RpcClient {
     }
 }
 
-fn spawn_codex() -> Result<(Child, String), String> {
+fn codex_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(path) = env::var("CODEX_METER_CODEX_PATH") {
         if !path.trim().is_empty() {
             candidates.push(path);
         }
     }
-    #[cfg(target_os = "windows")]
-    candidates.extend(["codex.exe".into(), "codex.cmd".into(), "codex".into()]);
-    #[cfg(not(target_os = "windows"))]
-    candidates.push("codex".into());
     #[cfg(target_os = "macos")]
     candidates.extend([
-        "/opt/homebrew/bin/codex".into(),
-        "/usr/local/bin/codex".into(),
         "/Applications/ChatGPT.app/Contents/Resources/codex".into(),
         "/Applications/Codex.app/Contents/Resources/codex".into(),
     ]);
@@ -233,26 +250,18 @@ fn spawn_codex() -> Result<(Child, String), String> {
             ]);
         }
     }
-
-    let mut last_error = String::new();
-    for program in candidates {
-        match Command::new(&program)
-            .args(["app-server", "--listen", "stdio://"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => return Ok((child, program)),
-            Err(error) => last_error = format!("{program}: {error}"),
-        }
-    }
     #[cfg(target_os = "windows")]
-    let help = "Codex Desktop 的 WindowsApps 内置程序不能作为外部 CLI 调用；请安装独立 Codex CLI 并登录，或把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
-    #[cfg(not(target_os = "windows"))]
-    let help = "请安装新版 ChatGPT/Codex 桌面程序或独立 Codex CLI 并登录，也可以把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
+    candidates.extend(["codex.exe".into(), "codex.cmd".into(), "codex".into()]);
+    #[cfg(target_os = "linux")]
+    candidates.push("codex".into());
+    #[cfg(target_os = "macos")]
+    candidates.extend([
+        "codex".into(),
+        "/opt/homebrew/bin/codex".into(),
+        "/usr/local/bin/codex".into(),
+    ]);
 
-    Err(format!("无法启动 Codex CLI（{last_error}）。{help}。"))
+    candidates
 }
 
 #[derive(Debug, Serialize, PartialEq)]

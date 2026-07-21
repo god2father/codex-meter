@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#223048"/>
+      <stop offset="1" stop-color="#0a101b"/>
+    </linearGradient>
+    <linearGradient id="ring" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#79e8ff"/>
+      <stop offset="1" stop-color="#5b8cff"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="128" fill="url(#glass)"/>
+  <circle cx="256" cy="256" r="148" fill="none" stroke="#ffffff" stroke-opacity=".16" stroke-width="38"/>
+  <path d="M256 108a148 148 0 1 1-142 106" fill="none" stroke="url(#ring)" stroke-linecap="round" stroke-width="38"/>
+  <circle cx="190" cy="168" r="12" fill="#dff9ff" fill-opacity=".9"/>
+  <text x="256" y="286" text-anchor="middle" fill="#f6fbff" font-family="Arial, sans-serif" font-size="86" font-weight="700">C</text>
+</svg>

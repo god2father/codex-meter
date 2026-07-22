@@ -9,6 +9,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Emitter, LogicalSize, Manager, PhysicalPosition, Rect, RunEvent, State, WindowEvent,
 };
+use tauri_plugin_autostart::MacosLauncher;
 
 struct AppState(Arc<Mutex<CodexService>>);
 
@@ -57,11 +58,17 @@ async fn refresh_usage(state: State<'_, AppState>) -> Result<UsageSnapshot, Stri
 }
 
 #[tauri::command]
+fn runtime_platform() -> &'static str {
+    std::env::consts::OS
+}
+
+#[tauri::command]
 fn update_tray_icon(
     app: tauri::AppHandle,
     rgba: Vec<u8>,
     width: u32,
     height: u32,
+    tooltip: String,
 ) -> Result<(), String> {
     if width == 0 || height == 0 || width > 128 || height > 128 {
         return Err("Tray icon dimensions must be between 1 and 128 pixels".into());
@@ -75,6 +82,8 @@ fn update_tray_icon(
     }
     let tray = app.tray_by_id("usage").ok_or("Tray icon is not ready")?;
     tray.set_icon(Some(Image::new_owned(rgba, width, height)))
+        .map_err(|error| error.to_string())?;
+    tray.set_tooltip(Some(tooltip))
         .map_err(|error| error.to_string())
 }
 
@@ -100,7 +109,7 @@ fn hide_panel(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn resize_panel(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), String> {
-    if !(280..=480).contains(&width) || !(180..=600).contains(&height) {
+    if !(280..=480).contains(&width) || !(180..=800).contains(&height) {
         return Err("Panel dimensions are outside the supported range".into());
     }
     let window = app
@@ -222,20 +231,205 @@ fn nearest_edge(x: i64, y: i64, left: i64, top: i64, right: i64, bottom: i64) ->
 }
 
 fn neutral_icon() -> Image<'static> {
-    let size = 32usize;
-    let mut rgba = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let dx = x as f32 - 15.5;
-            let dy = y as f32 - 15.5;
-            let radius = (dx * dx + dy * dy).sqrt();
-            if (11.0..=14.0).contains(&radius) {
-                let offset = (y * size + x) * 4;
-                rgba[offset..offset + 4].copy_from_slice(&[120, 130, 145, 255]);
+    #[cfg(target_os = "macos")]
+    {
+        neutral_icon_macos()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        neutral_icon_windows()
+    }
+}
+
+fn neutral_icon_windows() -> Image<'static> {
+    let width = 64usize;
+    let height = 64usize;
+    let mut rgba = glass_icon_base(width, height, 1, 1, 62, 62, 15);
+    paint_neutral_cat(&mut rgba, width, 32, 36, 29, 25);
+    Image::new_owned(rgba, width as u32, height as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn neutral_icon_macos() -> Image<'static> {
+    let width = 112usize;
+    let height = 48usize;
+    let mut rgba = glass_icon_base(width, height, 2, 2, 108, 44, 12);
+    paint_neutral_cat(&mut rgba, width, 25, 27, 18, 14);
+    for y in 17..32 {
+        for x in 52..107 {
+            if inside_rounded_rect(x, y, 52, 17, 54, 14, 7) {
+                set_pixel(&mut rgba, width, x, y, [3, 13, 24, 255]);
+            }
+            if inside_rounded_rect(x, y, 54, 21, 15, 6, 3) {
+                set_pixel(&mut rgba, width, x, y, [112, 143, 168, 255]);
             }
         }
     }
-    Image::new_owned(rgba, size as u32, size as u32)
+    Image::new_owned(rgba, width as u32, height as u32)
+}
+
+fn glass_icon_base(
+    width: usize,
+    height: usize,
+    left: usize,
+    top: usize,
+    glass_width: usize,
+    glass_height: usize,
+    radius: usize,
+) -> Vec<u8> {
+    let mut rgba = vec![0u8; width * height * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = if inside_rounded_rect(x, y, left, top, glass_width, glass_height, radius) {
+                let light = ((top + glass_height).saturating_sub(y) * 22 / glass_height) as u8;
+                [10 + light / 3, 26 + light / 2, 40 + light, 248]
+            } else {
+                [0, 0, 0, 0]
+            };
+            set_pixel(&mut rgba, width, x, y, pixel);
+        }
+    }
+    rgba
+}
+
+fn paint_neutral_cat(
+    rgba: &mut [u8],
+    row_width: usize,
+    center_x: i32,
+    center_y: i32,
+    radius_x: i32,
+    radius_y: i32,
+) {
+    let left = (center_x - radius_x).max(0) as usize;
+    let right = (center_x + radius_x).max(0) as usize;
+    let top = (center_y - radius_y - 10).max(0) as usize;
+    let bottom = (center_y + radius_y).max(0) as usize;
+    let left_ear = (
+        (center_x - radius_x + 2, center_y - radius_y + 5),
+        (center_x - radius_x / 2, center_y - radius_y - 9),
+        (center_x - 2, center_y - radius_y + 3),
+    );
+    let right_ear = (
+        (center_x + 2, center_y - radius_y + 3),
+        (center_x + radius_x / 2, center_y - radius_y - 9),
+        (center_x + radius_x - 2, center_y - radius_y + 5),
+    );
+    let contains = |x: usize, y: usize| {
+        inside_ellipse(x, y, center_x, center_y, radius_x, radius_y)
+            || inside_triangle(x, y, left_ear.0, left_ear.1, left_ear.2)
+            || inside_triangle(x, y, right_ear.0, right_ear.1, right_ear.2)
+    };
+    for y in top..=bottom {
+        for x in left..=right {
+            if contains(x, y) {
+                let boundary = !contains(x.saturating_sub(1), y)
+                    || !contains(x + 1, y)
+                    || !contains(x, y.saturating_sub(1))
+                    || !contains(x, y + 1);
+                let color = if boundary {
+                    [82, 236, 226, 255]
+                } else {
+                    [7, 35, 51, 255]
+                };
+                set_pixel(rgba, row_width, x, y, color);
+            }
+        }
+    }
+    for center in [center_x - radius_x / 3, center_x + radius_x / 3] {
+        let eye_x = center.max(0) as usize;
+        let eye_y = center_y.max(0) as usize;
+        for y in eye_y.saturating_sub(4)..=eye_y + 4 {
+            for x in eye_x.saturating_sub(3)..=eye_x + 3 {
+                if inside_ellipse(x, y, center, center_y, 3, 4) {
+                    set_pixel(rgba, row_width, x, y, [63, 229, 222, 255]);
+                }
+                if inside_ellipse(x, y, center, center_y, 2, 3) {
+                    set_pixel(rgba, row_width, x, y, [3, 20, 31, 255]);
+                }
+            }
+        }
+        set_pixel(
+            rgba,
+            row_width,
+            eye_x.saturating_sub(1),
+            eye_y.saturating_sub(2),
+            [242, 255, 255, 255],
+        );
+    }
+    let mouth_y = (center_y + radius_y / 3).max(0) as usize;
+    let mouth_x = center_x.max(0) as usize;
+    for &(x, y) in &[
+        (mouth_x.saturating_sub(3), mouth_y),
+        (mouth_x.saturating_sub(2), mouth_y + 1),
+        (mouth_x, mouth_y),
+        (mouth_x + 2, mouth_y + 1),
+        (mouth_x + 3, mouth_y),
+    ] {
+        set_pixel(rgba, row_width, x, y, [236, 255, 255, 255]);
+    }
+}
+
+fn set_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
+    let offset = (y * size + x) * 4;
+    rgba[offset..offset + 4].copy_from_slice(&color);
+}
+
+fn inside_ellipse(
+    x: usize,
+    y: usize,
+    center_x: i32,
+    center_y: i32,
+    radius_x: i32,
+    radius_y: i32,
+) -> bool {
+    let dx = (x as i32 - center_x) as f32 / radius_x as f32;
+    let dy = (y as i32 - center_y) as f32 / radius_y as f32;
+    dx * dx + dy * dy <= 1.0
+}
+
+fn inside_triangle(x: usize, y: usize, a: (i32, i32), b: (i32, i32), c: (i32, i32)) -> bool {
+    let point = (x as i32, y as i32);
+    let sign = |p1: (i32, i32), p2: (i32, i32), p3: (i32, i32)| {
+        (p1.0 - p3.0) * (p2.1 - p3.1) - (p2.0 - p3.0) * (p1.1 - p3.1)
+    };
+    let d1 = sign(point, a, b);
+    let d2 = sign(point, b, c);
+    let d3 = sign(point, c, a);
+    !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0))
+}
+
+fn inside_rounded_rect(
+    x: usize,
+    y: usize,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+    radius: usize,
+) -> bool {
+    if x < left || y < top || x >= left + width || y >= top + height {
+        return false;
+    }
+    let inner_left = left + radius;
+    let inner_right = left + width - radius - 1;
+    let inner_top = top + radius;
+    let inner_bottom = top + height - radius - 1;
+    if (inner_left..=inner_right).contains(&x) || (inner_top..=inner_bottom).contains(&y) {
+        return true;
+    }
+    let center_x = if x < inner_left {
+        inner_left
+    } else {
+        inner_right
+    };
+    let center_y = if y < inner_top {
+        inner_top
+    } else {
+        inner_bottom
+    };
+    let dx = x.abs_diff(center_x);
+    let dy = y.abs_diff(center_y);
+    dx * dx + dy * dy <= radius * radius
 }
 
 pub fn run() {
@@ -243,6 +437,10 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             let _ = show_main_window(app);
         }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
         .manage(AppState(Arc::new(Mutex::new(CodexService::new()))))
         .manage(TrayAnchorState(Mutex::new(None)))
         .setup(|app| {
@@ -311,6 +509,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
+            runtime_platform,
             update_tray_icon,
             resize_panel,
             hide_panel,
@@ -331,10 +530,8 @@ pub fn run() {
                         }
                     }
                     WindowEvent::Focused(false) => {
-                        if !preview_mode() {
-                            if let Some(window) = app.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.hide();
                         }
                     }
                     _ => {}

@@ -3,6 +3,5 @@
   "identifier": "default",
   "description": "Permissions for the Codex Meter window",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "autostart:default"]
 }
-

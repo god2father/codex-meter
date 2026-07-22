@@ -1,6 +1,6 @@
 [package]
 name = "codex-meter"
-version = "0.2.0"
+version = "0.2.1"
 description = "A tiny Codex usage tray app"
 edition = "2021"
 

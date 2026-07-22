@@ -68,6 +68,7 @@ fn update_tray_icon(
     rgba: Vec<u8>,
     width: u32,
     height: u32,
+    title: Option<String>,
     tooltip: String,
 ) -> Result<(), String> {
     if width == 0 || height == 0 || width > 128 || height > 128 {
@@ -84,6 +85,8 @@ fn update_tray_icon(
     tray.set_icon(Some(Image::new_owned(rgba, width, height)))
         .map_err(|error| error.to_string())?;
     tray.set_tooltip(Some(tooltip))
+        .map_err(|error| error.to_string())?;
+    tray.set_title(title.as_deref())
         .map_err(|error| error.to_string())
 }
 
@@ -241,6 +244,7 @@ fn neutral_icon() -> Image<'static> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn neutral_icon_windows() -> Image<'static> {
     let width = 64usize;
     let height = 64usize;
@@ -251,16 +255,16 @@ fn neutral_icon_windows() -> Image<'static> {
 
 #[cfg(target_os = "macos")]
 fn neutral_icon_macos() -> Image<'static> {
-    let width = 112usize;
+    let width = 104usize;
     let height = 48usize;
-    let mut rgba = glass_icon_base(width, height, 2, 2, 108, 44, 12);
-    paint_neutral_cat(&mut rgba, width, 25, 27, 18, 14);
-    for y in 17..32 {
-        for x in 52..107 {
-            if inside_rounded_rect(x, y, 52, 17, 54, 14, 7) {
-                set_pixel(&mut rgba, width, x, y, [3, 13, 24, 255]);
+    let mut rgba = vec![0u8; width * height * 4];
+    paint_neutral_cat(&mut rgba, width, 24, 27, 18, 14);
+    for y in 37..46 {
+        for x in 54..102 {
+            if inside_rounded_rect(x, y, 54, 37, 48, 9, 4) {
+                set_pixel(&mut rgba, width, x, y, [37, 57, 72, 110]);
             }
-            if inside_rounded_rect(x, y, 54, 21, 15, 6, 3) {
+            if inside_rounded_rect(x, y, 56, 39, 13, 5, 2) {
                 set_pixel(&mut rgba, width, x, y, [112, 143, 168, 255]);
             }
         }
@@ -268,6 +272,7 @@ fn neutral_icon_macos() -> Image<'static> {
     Image::new_owned(rgba, width as u32, height as u32)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn glass_icon_base(
     width: usize,
     height: usize,
@@ -327,24 +332,127 @@ fn paint_neutral_cat(
                     || !contains(x, y.saturating_sub(1))
                     || !contains(x, y + 1);
                 let color = if boundary {
-                    [82, 236, 226, 255]
+                    [63, 43, 32, 255]
                 } else {
-                    [7, 35, 51, 255]
+                    let warmth = ((bottom.saturating_sub(y)) * 24 / (bottom - top).max(1)) as u8;
+                    [164 + warmth / 2, 113 + warmth / 2, 73 + warmth / 3, 255]
                 };
                 set_pixel(rgba, row_width, x, y, color);
             }
         }
     }
+
+    let left_inner_ear = (
+        (center_x - radius_x + 5, center_y - radius_y + 5),
+        (center_x - radius_x / 2, center_y - radius_y - 4),
+        (center_x - 6, center_y - radius_y + 4),
+    );
+    let right_inner_ear = (
+        (center_x + 6, center_y - radius_y + 4),
+        (center_x + radius_x / 2, center_y - radius_y - 4),
+        (center_x + radius_x - 5, center_y - radius_y + 5),
+    );
+    for y in top..=bottom {
+        for x in left..=right {
+            if inside_triangle(x, y, left_inner_ear.0, left_inner_ear.1, left_inner_ear.2)
+                || inside_triangle(
+                    x,
+                    y,
+                    right_inner_ear.0,
+                    right_inner_ear.1,
+                    right_inner_ear.2,
+                )
+            {
+                set_pixel(rgba, row_width, x, y, [238, 165, 161, 255]);
+            }
+        }
+    }
+
+    for y in top..=bottom {
+        for x in left..=right {
+            let blaze = inside_ellipse(
+                x,
+                y,
+                center_x,
+                center_y - radius_y / 4,
+                (radius_x / 5).max(3),
+                (radius_y * 3 / 4).max(5),
+            );
+            let muzzle = inside_ellipse(
+                x,
+                y,
+                center_x - radius_x / 5,
+                center_y + radius_y / 3,
+                (radius_x * 2 / 5).max(5),
+                (radius_y / 3).max(4),
+            ) || inside_ellipse(
+                x,
+                y,
+                center_x + radius_x / 5,
+                center_y + radius_y / 3,
+                (radius_x * 2 / 5).max(5),
+                (radius_y / 3).max(4),
+            );
+            if blaze || muzzle {
+                set_pixel(rgba, row_width, x, y, [248, 232, 219, 255]);
+            }
+        }
+    }
+
+    let face_top = center_y - radius_y;
+    for (offset, lean) in [(-radius_x / 3, 1), (0, 0), (radius_x / 3, -1)] {
+        for step in 2..=(radius_y / 2).max(3) {
+            let stripe_x = center_x + offset + lean * step / 4;
+            let stripe_y = face_top + step;
+            for x in (stripe_x - 1).max(0)..=stripe_x + 1 {
+                set_pixel(
+                    rgba,
+                    row_width,
+                    x as usize,
+                    stripe_y.max(0) as usize,
+                    [67, 43, 28, 255],
+                );
+            }
+        }
+    }
+
+    let eye_radius_x = (radius_x * 3 / 10).max(5);
+    let eye_radius_y = (radius_y * 3 / 10).max(4);
+    let eye_y = center_y - radius_y / 7;
     for center in [center_x - radius_x / 3, center_x + radius_x / 3] {
         let eye_x = center.max(0) as usize;
-        let eye_y = center_y.max(0) as usize;
-        for y in eye_y.saturating_sub(4)..=eye_y + 4 {
-            for x in eye_x.saturating_sub(3)..=eye_x + 3 {
-                if inside_ellipse(x, y, center, center_y, 3, 4) {
-                    set_pixel(rgba, row_width, x, y, [63, 229, 222, 255]);
+        let eye_y = eye_y.max(0) as usize;
+        for y in eye_y.saturating_sub(eye_radius_y as usize)..=eye_y + eye_radius_y as usize {
+            for x in eye_x.saturating_sub(eye_radius_x as usize)..=eye_x + eye_radius_x as usize {
+                if inside_ellipse(x, y, center, eye_y as i32, eye_radius_x, eye_radius_y) {
+                    set_pixel(rgba, row_width, x, y, [46, 31, 24, 255]);
                 }
-                if inside_ellipse(x, y, center, center_y, 2, 3) {
-                    set_pixel(rgba, row_width, x, y, [3, 20, 31, 255]);
+            }
+        }
+        for y in
+            eye_y.saturating_sub((eye_radius_y - 1) as usize)..=eye_y + (eye_radius_y - 1) as usize
+        {
+            for x in eye_x.saturating_sub((eye_radius_x - 1) as usize)
+                ..=eye_x + (eye_radius_x - 1) as usize
+            {
+                if inside_ellipse(
+                    x,
+                    y,
+                    center,
+                    eye_y as i32,
+                    eye_radius_x - 1,
+                    eye_radius_y - 1,
+                ) {
+                    set_pixel(rgba, row_width, x, y, [235, 157, 35, 255]);
+                }
+            }
+        }
+        for y in
+            eye_y.saturating_sub((eye_radius_y - 1) as usize)..=eye_y + (eye_radius_y - 1) as usize
+        {
+            for x in eye_x.saturating_sub(1)..=eye_x + 1 {
+                if inside_ellipse(x, y, center, eye_y as i32, 2, eye_radius_y - 1) {
+                    set_pixel(rgba, row_width, x, y, [30, 22, 18, 255]);
                 }
             }
         }
@@ -352,20 +460,28 @@ fn paint_neutral_cat(
             rgba,
             row_width,
             eye_x.saturating_sub(1),
-            eye_y.saturating_sub(2),
-            [242, 255, 255, 255],
+            eye_y.saturating_sub(1),
+            [255, 250, 230, 255],
         );
     }
-    let mouth_y = (center_y + radius_y / 3).max(0) as usize;
+
+    let nose_y = (center_y + radius_y / 4).max(0) as usize;
     let mouth_x = center_x.max(0) as usize;
+    for y in nose_y.saturating_sub(1)..=nose_y + 1 {
+        for x in mouth_x.saturating_sub(2)..=mouth_x + 2 {
+            set_pixel(rgba, row_width, x, y, [171, 109, 102, 255]);
+        }
+    }
+    let mouth_y = nose_y + 3;
     for &(x, y) in &[
-        (mouth_x.saturating_sub(3), mouth_y),
-        (mouth_x.saturating_sub(2), mouth_y + 1),
+        (mouth_x, nose_y + 2),
         (mouth_x, mouth_y),
+        (mouth_x.saturating_sub(3), mouth_y + 2),
+        (mouth_x.saturating_sub(2), mouth_y + 1),
         (mouth_x + 2, mouth_y + 1),
-        (mouth_x + 3, mouth_y),
+        (mouth_x + 3, mouth_y + 2),
     ] {
-        set_pixel(rgba, row_width, x, y, [236, 255, 255, 255]);
+        set_pixel(rgba, row_width, x, y, [53, 43, 42, 255]);
     }
 }
 

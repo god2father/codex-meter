@@ -69,7 +69,6 @@ const mockSnapshot: UsageSnapshot = {
 const CACHE_KEY = "codex-meter:last-usage";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
-const reducedMotionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
 let snapshot: UsageSnapshot | null = isTauri ? loadCachedSnapshot() : mockSnapshot;
 let runtimePlatform: RuntimePlatform = isTauri ? "other" : "windows";
 let loading = isTauri && !snapshot;
@@ -84,7 +83,6 @@ let lastPanelSize = "";
 let panelSyncFrame = 0;
 let panelResizeObserver: ResizeObserver | null = null;
 let lastRenderedFreshness: DataFreshness | null = null;
-let trayAnimationRunning = false;
 let freshnessExpiryTimer = 0;
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -379,6 +377,9 @@ function render(): void {
   const windowCount = Number(Boolean(data?.primary)) + Number(Boolean(data?.secondary));
   const footerCopy = footerStatusCopy(freshness);
   const statusIcon = state === "ok" ? "shield" : state === "loading" ? "clock" : "alert";
+  const statusIndicator = state === "ok"
+    ? `<img class="status-cat" src="${statusCatImage("healthy")}" alt="" />`
+    : icon(statusIcon);
 
   app.innerHTML = `
     <div class="panel-shell">
@@ -395,7 +396,7 @@ function render(): void {
           <button class="icon-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="${settingsOpen}" aria-controls="settings-card">${icon("settings")}</button>
         </div>
       </header>
-      <p class="status-line" role="status" aria-live="polite"><span class="status-icon">${icon(statusIcon)}</span><span>${status.label}</span></p>
+      <p class="status-line" role="status" aria-live="polite"><span class="status-icon">${statusIndicator}</span><span>${status.label}</span></p>
 
       ${data && tightest ? `
         <div class="usage-hero" data-tone="${usageTone(remaining)}">
@@ -546,7 +547,7 @@ interface TrayPresentation {
   remaining: number;
   color: string;
   alertDot: boolean;
-  canShimmer: boolean;
+  title: string;
   tooltip: string;
 }
 
@@ -560,7 +561,7 @@ function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
       remaining: unavailable ? 0 : 28,
       color: "#7890aa",
       alertDot: unavailable,
-      canShimmer: false,
+      title: unavailable ? "—" : "…",
       tooltip: unavailable ? "Codex 暂时无法获取用量" : "Codex 正在获取用量",
     };
   }
@@ -572,7 +573,7 @@ function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
       remaining,
       color: "#f2ae42",
       alertDot: true,
-      canShimmer: false,
+      title: `${remaining}%`,
       tooltip: `Codex 数据已过期 · 剩余 ${remaining}%`,
     };
   }
@@ -591,7 +592,7 @@ function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
     remaining,
     color: usageColor(remaining),
     alertDot: false,
-    canShimmer: runtimePlatform === "macos" && freshness === "fresh" && data.status === "ok" && !refreshing && remaining > 0,
+    title: `${remaining}%`,
     tooltip: `${prefix} · 剩余 ${remaining}%`,
   };
 }
@@ -608,141 +609,188 @@ function roundedRectPath(context: CanvasRenderingContext2D, x: number, y: number
 }
 
 function drawCatFace(context: CanvasRenderingContext2D, mood: CatMood): void {
-  const accent = mood === "warning" || mood === "sleeping"
-    ? "#f2c15a"
-    : mood === "critical" || mood === "exhausted"
-      ? "#ff7e8e"
-      : mood === "neutral"
-        ? "#8eb7ca"
-        : "#63f1e5";
-  const earTipY = mood === "healthy" ? 7 : mood === "warning" || mood === "sleeping" || mood === "neutral" ? 10 : 14;
-  const drawEar = (points: Array<[number, number]>): void => {
+  const drawEar = (points: Array<[number, number]>, inner: Array<[number, number]>): void => {
     context.beginPath();
     context.moveTo(points[0][0], points[0][1]);
     for (const [x, y] of points.slice(1)) context.lineTo(x, y);
     context.closePath();
-    context.fillStyle = "rgba(7, 30, 44, .98)";
+    context.fillStyle = "#ae8257";
     context.fill();
-    context.strokeStyle = accent;
-    context.lineWidth = 2.1;
+    context.strokeStyle = "#3f2c22";
+    context.lineWidth = 1.4;
     context.stroke();
+
+    context.beginPath();
+    context.moveTo(inner[0][0], inner[0][1]);
+    for (const [x, y] of inner.slice(1)) context.lineTo(x, y);
+    context.closePath();
+    context.fillStyle = "#efaaa4";
+    context.fill();
   };
 
   context.lineJoin = "round";
-  context.shadowColor = accent;
-  context.shadowBlur = 3;
-  if (mood === "critical" || mood === "exhausted") {
-    drawEar([[18, 19], [10, earTipY], [13, 27]]);
-    drawEar([[46, 19], [54, earTipY], [51, 27]]);
-  } else {
-    drawEar([[15, 21], [18, earTipY], [27, 18]]);
-    drawEar([[37, 18], [46, earTipY], [49, 21]]);
-  }
+  drawEar([[11, 22], [15, 3], [29, 18]], [[15, 17], [17, 7], [24, 17]]);
+  drawEar([[35, 18], [49, 3], [53, 22]], [[40, 17], [47, 7], [49, 17]]);
 
-  const faceGradient = context.createLinearGradient(18, 15, 46, 40);
-  faceGradient.addColorStop(0, "#153c50");
-  faceGradient.addColorStop(.52, "#092739");
-  faceGradient.addColorStop(1, "#041522");
+  const faceGradient = context.createLinearGradient(12, 14, 52, 46);
+  faceGradient.addColorStop(0, "#c39a68");
+  faceGradient.addColorStop(.48, "#a8764e");
+  faceGradient.addColorStop(1, "#7e563d");
+  context.beginPath();
+  context.ellipse(32, 29, 21.5, 16.5, 0, 0, Math.PI * 2);
   context.fillStyle = faceGradient;
-  context.strokeStyle = accent;
-  context.lineWidth = 2.1;
-  roundedRectPath(context, 14, 15, 36, 27, 13);
   context.fill();
+  context.strokeStyle = "#3f2c22";
+  context.lineWidth = 1.3;
   context.stroke();
-  context.shadowBlur = 0;
 
-  context.strokeStyle = accent;
-  context.fillStyle = accent;
-  context.lineWidth = 2;
+  context.strokeStyle = "rgba(67, 42, 28, .95)";
+  context.lineWidth = 2.7;
   context.lineCap = "round";
-  if (mood === "sleeping" || mood === "exhausted") {
+  context.beginPath();
+  context.moveTo(24, 14);
+  context.lineTo(27.5, 22);
+  context.moveTo(32, 12.5);
+  context.lineTo(32, 22.5);
+  context.moveTo(40, 14);
+  context.lineTo(36.5, 22);
+  context.moveTo(13.5, 24);
+  context.lineTo(20, 27);
+  context.moveTo(12.5, 30);
+  context.lineTo(19, 31.5);
+  context.moveTo(50.5, 24);
+  context.lineTo(44, 27);
+  context.moveTo(51.5, 30);
+  context.lineTo(45, 31.5);
+  context.stroke();
+
+  context.fillStyle = "#f7e7dc";
+  context.beginPath();
+  context.moveTo(28.5, 17);
+  context.bezierCurveTo(30, 21, 29, 27, 30.5, 31.5);
+  context.lineTo(33.5, 31.5);
+  context.bezierCurveTo(35, 27, 34, 21, 35.5, 17);
+  context.quadraticCurveTo(32, 19, 28.5, 17);
+  context.fill();
+  context.beginPath();
+  context.ellipse(25.5, 35, 9.5, 7, -.1, 0, Math.PI * 2);
+  context.ellipse(38.5, 35, 9.5, 7, .1, 0, Math.PI * 2);
+  context.fill();
+
+  const drawEye = (centerX: number): void => {
     context.beginPath();
-    context.moveTo(22, 28);
-    context.quadraticCurveTo(25, 30, 28, 28);
-    context.moveTo(36, 28);
-    context.quadraticCurveTo(39, 30, 42, 28);
+    context.ellipse(centerX, 26.5, 6.6, 6.2, 0, 0, Math.PI * 2);
+    context.fillStyle = "#2d201a";
+    context.fill();
+    context.beginPath();
+    context.ellipse(centerX, 26.5, 5.1, 4.9, 0, 0, Math.PI * 2);
+    const iris = context.createRadialGradient(centerX - 1.5, 24, .6, centerX, 26.5, 5.5);
+    iris.addColorStop(0, "#ffd77a");
+    iris.addColorStop(.65, "#e79b22");
+    iris.addColorStop(1, "#9a5513");
+    context.fillStyle = iris;
+    context.fill();
+    context.beginPath();
+    context.ellipse(centerX, 27, 1.8, 3.5, 0, 0, Math.PI * 2);
+    context.fillStyle = "#201813";
+    context.fill();
+    context.beginPath();
+    context.arc(centerX - 1.7, 24.4, 1.2, 0, Math.PI * 2);
+    context.fillStyle = "rgba(255, 252, 235, .92)";
+    context.fill();
+  };
+
+  if (mood === "sleeping" || mood === "exhausted") {
+    context.strokeStyle = "#3a2920";
+    context.lineWidth = 2.2;
+    context.beginPath();
+    context.moveTo(16.5, 27);
+    context.quadraticCurveTo(23, 31, 29.5, 27);
+    context.moveTo(34.5, 27);
+    context.quadraticCurveTo(41, 31, 47.5, 27);
     context.stroke();
   } else {
-    for (const eyeX of [25, 39]) {
-      const eyeGradient = context.createRadialGradient(eyeX - 1, 26, .6, eyeX, 28, 5);
-      eyeGradient.addColorStop(0, "#f5ffff");
-      eyeGradient.addColorStop(.22, "#9ffcf4");
-      eyeGradient.addColorStop(.38, "#1db9b4");
-      eyeGradient.addColorStop(.72, "#092c3e");
-      eyeGradient.addColorStop(1, "#020c15");
-      context.beginPath();
-      context.ellipse(eyeX, 27.5, mood === "critical" ? 4.2 : 3.8, 4.8, 0, 0, Math.PI * 2);
-      context.fillStyle = eyeGradient;
-      context.fill();
-      context.strokeStyle = accent;
-      context.lineWidth = 1.1;
-      context.stroke();
-      context.beginPath();
-      context.arc(eyeX - 1.1, 26, 1, 0, Math.PI * 2);
-      context.fillStyle = "rgba(255, 255, 255, .95)";
-      context.fill();
-    }
+    drawEye(23);
+    drawEye(41);
   }
 
-  context.fillStyle = "#f4ffff";
+  context.fillStyle = "#e69b9b";
   context.beginPath();
-  context.moveTo(30.5, 32.5);
-  context.lineTo(33.5, 32.5);
-  context.lineTo(32, 34);
+  context.moveTo(28.8, 33.5);
+  context.quadraticCurveTo(32, 31.4, 35.2, 33.5);
+  context.lineTo(32, 36.3);
   context.closePath();
   context.fill();
-  context.strokeStyle = "#f4ffff";
-  context.lineWidth = 1.7;
+
+  context.strokeStyle = "#493229";
+  context.lineWidth = 1.25;
   context.beginPath();
-  if (mood === "healthy") {
-    context.moveTo(32, 34);
-    context.quadraticCurveTo(29.5, 37, 27.5, 35);
-    context.moveTo(32, 34);
-    context.quadraticCurveTo(34.5, 37, 36.5, 35);
-  } else if (mood === "critical" || mood === "exhausted") {
-    context.moveTo(28.5, 37);
-    context.quadraticCurveTo(32, 33.8, 35.5, 37);
-  } else {
-    context.moveTo(28.5, 35.5);
-    context.quadraticCurveTo(32, 36.5, 35.5, 35.5);
-  }
+  context.moveTo(32, 35.5);
+  context.lineTo(32, 38.5);
+  context.moveTo(32, 38.5);
+  context.quadraticCurveTo(29, 37, 27, 39.5);
+  context.moveTo(32, 38.5);
+  context.quadraticCurveTo(35, 37, 37, 39.5);
+  context.stroke();
+
+  context.strokeStyle = "rgba(255, 244, 229, .9)";
+  context.lineWidth = .8;
+  context.beginPath();
+  context.moveTo(25, 35);
+  context.lineTo(10, 32);
+  context.moveTo(25, 37);
+  context.lineTo(8, 38);
+  context.moveTo(39, 35);
+  context.lineTo(54, 32);
+  context.moveTo(39, 37);
+  context.lineTo(56, 38);
   context.stroke();
 }
 
-function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPresentation, shimmerPosition?: number): void {
+function statusCatImage(mood: CatMood): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const context = canvas.getContext("2d");
+  if (!context) return "";
+  context.translate(-6, 6);
+  context.scale(1.25, 1.25);
+  drawCatFace(context, mood);
+  return canvas.toDataURL("image/png");
+}
+
+function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPresentation): void {
   const darkMode = themeQuery.matches;
   const isMacOS = runtimePlatform === "macos";
-  const canvasWidth = isMacOS ? 112 : 64;
+  const canvasWidth = isMacOS ? 104 : 64;
   const canvasHeight = isMacOS ? 48 : 64;
-  const glassX = isMacOS ? 2 : 1;
-  const glassY = isMacOS ? 2 : 1;
-  const glassWidth = isMacOS ? 108 : 62;
-  const glassHeight = isMacOS ? 44 : 62;
   context.clearRect(0, 0, canvasWidth, canvasHeight);
 
-  const glass = context.createLinearGradient(glassX + 3, glassY, glassX + glassWidth - 3, glassY + glassHeight);
-  glass.addColorStop(0, darkMode ? "rgba(31, 61, 81, .98)" : "rgba(36, 74, 96, .97)");
-  glass.addColorStop(.52, darkMode ? "rgba(5, 17, 30, .99)" : "rgba(9, 28, 43, .99)");
-  glass.addColorStop(1, darkMode ? "rgba(18, 39, 57, .98)" : "rgba(20, 47, 65, .98)");
-  roundedRectPath(context, glassX, glassY, glassWidth, glassHeight, isMacOS ? 12 : 15);
-  context.fillStyle = glass;
-  context.fill();
-  context.strokeStyle = darkMode ? "rgba(220, 245, 250, .68)" : "rgba(200, 239, 246, .82)";
-  context.lineWidth = 1.4;
-  context.stroke();
+  if (!isMacOS) {
+    const glass = context.createLinearGradient(4, 1, 60, 63);
+    glass.addColorStop(0, darkMode ? "rgba(31, 61, 81, .98)" : "rgba(36, 74, 96, .97)");
+    glass.addColorStop(.52, darkMode ? "rgba(5, 17, 30, .99)" : "rgba(9, 28, 43, .99)");
+    glass.addColorStop(1, darkMode ? "rgba(18, 39, 57, .98)" : "rgba(20, 47, 65, .98)");
+    roundedRectPath(context, 1, 1, 62, 62, 15);
+    context.fillStyle = glass;
+    context.fill();
+    context.strokeStyle = darkMode ? "rgba(220, 245, 250, .68)" : "rgba(200, 239, 246, .82)";
+    context.lineWidth = 1.4;
+    context.stroke();
 
-  const glassShine = context.createLinearGradient(glassX + 7, glassY + 2, glassX + glassWidth * .55, glassY + glassHeight * .65);
-  glassShine.addColorStop(0, "rgba(255, 255, 255, .5)");
-  glassShine.addColorStop(.45, "rgba(255, 255, 255, .09)");
-  glassShine.addColorStop(1, "rgba(255, 255, 255, 0)");
-  roundedRectPath(context, glassX + 2, glassY + 2, glassWidth - 4, glassHeight - 4, isMacOS ? 10 : 12);
-  context.fillStyle = glassShine;
-  context.fill();
+    const glassShine = context.createLinearGradient(8, 3, 35, 41);
+    glassShine.addColorStop(0, "rgba(255, 255, 255, .5)");
+    glassShine.addColorStop(.45, "rgba(255, 255, 255, .09)");
+    glassShine.addColorStop(1, "rgba(255, 255, 255, 0)");
+    roundedRectPath(context, 3, 3, 58, 58, 12);
+    context.fillStyle = glassShine;
+    context.fill();
+  }
 
   context.save();
   if (isMacOS) {
-    context.translate(1, 3);
-    context.scale(.88, .88);
+    context.translate(-1, 2);
+    context.scale(.92, .92);
   } else {
     context.translate(-11, -9);
     context.scale(1.35, 1.62);
@@ -751,45 +799,34 @@ function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPr
   context.restore();
 
   if (isMacOS) {
-    roundedRectPath(context, 52, 17, 54, 14, 7);
-    context.fillStyle = "rgba(1, 10, 20, .82)";
-    context.fill();
-    context.strokeStyle = "rgba(186, 219, 231, .3)";
-    context.lineWidth = 1;
-    context.stroke();
+    context.save();
+    context.font = '600 22px -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif';
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.fillStyle = darkMode ? "rgba(239, 252, 255, .96)" : "rgba(13, 36, 52, .96)";
+    context.shadowColor = presentation.color;
+    context.shadowBlur = 1.5;
+    context.fillText(presentation.title, 78, 15);
+    context.restore();
 
-    const fillWidth = Math.max(0, 50 * presentation.remaining / 100);
+    roundedRectPath(context, 54, 37, 48, 9, 4.5);
+    context.fillStyle = darkMode ? "rgba(231, 248, 255, .18)" : "rgba(10, 31, 47, .18)";
+    context.fill();
+
+    const fillWidth = 44 * presentation.remaining / 100;
     if (fillWidth > 0) {
-      roundedRectPath(context, 54, 21, Math.max(3, fillWidth), 6, 3);
-      const progress = context.createLinearGradient(54, 21, 104, 27);
+      roundedRectPath(context, 56, 39, Math.max(3, fillWidth), 5, 2.5);
+      const progress = context.createLinearGradient(56, 41.5, 100, 41.5);
       progress.addColorStop(0, presentation.color);
-      progress.addColorStop(.65, presentation.color);
+      progress.addColorStop(.7, presentation.color);
       progress.addColorStop(1, "#d7fff7");
       context.fillStyle = progress;
       context.fill();
-
-      context.save();
-      roundedRectPath(context, 54, 21, Math.max(3, fillWidth), 6, 3);
-      context.clip();
-      context.fillStyle = "rgba(255, 255, 255, .42)";
-      context.fillRect(55, 21.5, Math.max(1, fillWidth - 2), 1.3);
-      if (shimmerPosition !== undefined) {
-        const shimmerX = 50 + (fillWidth + 12) * shimmerPosition;
-        context.translate(shimmerX, 19);
-        context.rotate(-.28);
-        const shimmer = context.createLinearGradient(-5, 0, 5, 0);
-        shimmer.addColorStop(0, "rgba(255, 255, 255, 0)");
-        shimmer.addColorStop(.5, "rgba(255, 255, 255, .82)");
-        shimmer.addColorStop(1, "rgba(255, 255, 255, 0)");
-        context.fillStyle = shimmer;
-        context.fillRect(-5, 0, 10, 12);
-      }
-      context.restore();
     }
   }
 
   if (presentation.alertDot) {
-    const alertX = isMacOS ? 43 : 55;
+    const alertX = isMacOS ? 39 : 55;
     const alertY = isMacOS ? 8 : 8;
     context.save();
     context.beginPath();
@@ -807,9 +844,9 @@ function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPr
   }
 }
 
-async function updateTrayIcon(data: UsageSnapshot | null, shimmerPosition?: number): Promise<void> {
+async function updateTrayIcon(data: UsageSnapshot | null): Promise<void> {
   if (!isTauri) return;
-  const width = runtimePlatform === "macos" ? 112 : 64;
+  const width = runtimePlatform === "macos" ? 104 : 64;
   const height = runtimePlatform === "macos" ? 48 : 64;
   const canvas = document.createElement("canvas");
   canvas.width = width;
@@ -817,28 +854,18 @@ async function updateTrayIcon(data: UsageSnapshot | null, shimmerPosition?: numb
   const context = canvas.getContext("2d");
   if (!context) return;
   const presentation = trayPresentation(data);
-  drawTrayArtwork(context, presentation, shimmerPosition);
+  drawTrayArtwork(context, presentation);
   const rgba = Array.from(context.getImageData(0, 0, width, height).data);
   try {
-    await invoke("update_tray_icon", { rgba, width, height, tooltip: presentation.tooltip });
+    await invoke("update_tray_icon", {
+      rgba,
+      width,
+      height,
+      title: runtimePlatform === "macos" ? "" : null,
+      tooltip: presentation.tooltip,
+    });
   } catch {
     // Older backends may not expose dynamic tray icons; usage UI remains functional.
-  }
-}
-
-async function playTrayShimmer(): Promise<void> {
-  const presentation = trayPresentation(snapshot);
-  if (trayAnimationRunning || reducedMotionQuery.matches || !presentation.canShimmer) return;
-  trayAnimationRunning = true;
-  try {
-    for (const position of [0, .28, .56, .84, 1]) {
-      if (reducedMotionQuery.matches || !trayPresentation(snapshot).canShimmer) break;
-      await updateTrayIcon(snapshot, position);
-      await new Promise<void>((resolve) => window.setTimeout(resolve, 110));
-    }
-    await updateTrayIcon(snapshot);
-  } finally {
-    trayAnimationRunning = false;
   }
 }
 
@@ -909,12 +936,7 @@ window.setInterval(() => {
 }, 30_000);
 
 window.setInterval(() => void refreshUsage(), 60_000);
-window.setInterval(() => void playTrayShimmer(), 12_000);
 
 themeQuery.addEventListener("change", () => {
-  void updateTrayIcon(snapshot);
-});
-
-reducedMotionQuery.addEventListener("change", () => {
   void updateTrayIcon(snapshot);
 });

@@ -252,6 +252,7 @@ h2 { font-size: 16px; font-weight: 650; }
 }
 
 .status-icon svg { width: 30px; height: 30px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; }
+.status-cat { width: 30px; height: 30px; object-fit: contain; image-rendering: pixelated; }
 [data-state="reconnecting"] .status-line,
 [data-state="expired"] .status-line { color: #a86211; }
 [data-state="reconnecting"] .status-icon,

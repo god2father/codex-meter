@@ -1,4 +1,5 @@
 mod codex;
+mod token_usage;
 
 use codex::{CodexService, UsageSnapshot};
 use serde::Serialize;
@@ -55,6 +56,16 @@ async fn refresh_usage(state: State<'_, AppState>) -> Result<UsageSnapshot, Stri
         Err(_) => UsageSnapshot::service_error("Usage refresh task stopped unexpectedly"),
     };
     Ok(snapshot)
+}
+
+#[tauri::command]
+async fn read_token_usage(
+    day_start_iso: String,
+    day_start_unix: u64,
+) -> Result<token_usage::TokenUsageSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || token_usage::read(&day_start_iso, day_start_unix))
+        .await
+        .map_err(|_| "Token 用量读取任务意外停止".to_owned())?
 }
 
 #[tauri::command]
@@ -625,6 +636,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
+            read_token_usage,
             runtime_platform,
             update_tray_icon,
             resize_panel,

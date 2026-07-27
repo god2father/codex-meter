@@ -31,6 +31,28 @@ interface UsageSnapshot {
   error?: string | null;
 }
 
+interface TokenUsageBreakdown {
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  reasoningOutputTokens: number;
+  totalTokens: number;
+}
+
+interface TokenUsagePeriod extends TokenUsageBreakdown {
+  startedAt: string | null;
+  updatedAt: string;
+  active: boolean;
+}
+
+interface TokenUsageSnapshot {
+  recentTurn: TokenUsagePeriod | null;
+  today: TokenUsageBreakdown;
+  currentSession: TokenUsagePeriod | null;
+  fetchedAt: number;
+  sourceAvailable: boolean;
+}
+
 interface PanelPosition {
   anchorX: number;
   anchorY: number;
@@ -66,13 +88,50 @@ const mockSnapshot: UsageSnapshot = {
   fetchedAt: Math.floor(Date.now() / 1000),
 };
 
+const mockTokenSnapshot: TokenUsageSnapshot = {
+  recentTurn: {
+    inputTokens: 15_260,
+    cachedInputTokens: 11_800,
+    outputTokens: 3_160,
+    reasoningOutputTokens: 1_240,
+    totalTokens: 18_420,
+    startedAt: new Date(Date.now() - 95_000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    active: false,
+  },
+  today: {
+    inputTokens: 109_400,
+    cachedInputTokens: 82_100,
+    outputTokens: 17_400,
+    reasoningOutputTokens: 6_800,
+    totalTokens: 126_800,
+  },
+  currentSession: {
+    inputTokens: 62_600,
+    cachedInputTokens: 49_300,
+    outputTokens: 11_750,
+    reasoningOutputTokens: 4_900,
+    totalTokens: 74_350,
+    startedAt: null,
+    updatedAt: new Date().toISOString(),
+    active: false,
+  },
+  fetchedAt: Math.floor(Date.now() / 1000),
+  sourceAvailable: true,
+};
+
 const CACHE_KEY = "codex-meter:last-usage";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 let snapshot: UsageSnapshot | null = isTauri ? loadCachedSnapshot() : mockSnapshot;
+let tokenSnapshot: TokenUsageSnapshot | null = isTauri ? null : mockTokenSnapshot;
 let runtimePlatform: RuntimePlatform = isTauri ? "other" : "windows";
 let loading = isTauri && !snapshot;
 let refreshing = false;
+let tokenLoading = isTauri;
+let tokenRefreshing = false;
+let tokenError = "";
+let tokenDetailsOpen = false;
 let errorMessage = "";
 let settingsOpen = false;
 let autostartEnabled = !isTauri;
@@ -141,6 +200,15 @@ function formatUpdated(unixSeconds: number): string {
   if (elapsed < 60) return `${elapsed} 秒前更新`;
   if (elapsed < 3600) return `${Math.floor(elapsed / 60)} 分钟前更新`;
   return `${Math.floor(elapsed / 3600)} 小时前更新`;
+}
+
+function formatTokenSummary(value: number): string {
+  const normalized = Math.max(0, Math.round(value));
+  const scaled = normalized / 10_000;
+  const maximumFractionDigits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
+  return `${new Intl.NumberFormat("zh-CN", {
+    maximumFractionDigits,
+  }).format(scaled)}万`;
 }
 
 function tightestWindow(data: UsageSnapshot): LimitWindow | null {
@@ -303,7 +371,7 @@ async function setAutostart(enabled: boolean): Promise<void> {
   }
 }
 
-function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power"): string {
+function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens"): string {
   const paths = {
     refresh: '<path d="M20 11a8.1 8.1 0 1 0 .1 4M20 4v7h-7"/>',
     settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
@@ -316,6 +384,7 @@ function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert
     close: '<path d="m6 6 12 12M18 6 6 18"/>',
     moon: '<path d="M20 15.2A8 8 0 0 1 8.8 4 8 8 0 1 0 20 15.2Z"/>',
     power: '<path d="M12 3v9M6.3 6.3a8 8 0 1 0 11.4 0"/>',
+    tokens: '<path d="M4 19h16M6 16V9M12 16V5M18 16v-4"/>',
   };
   return `<svg aria-hidden="true" viewBox="0 0 24 24">${paths[name]}</svg>`;
 }
@@ -353,6 +422,73 @@ function renderUpdatedCard(fetchedAt: number): string {
         <small>来自 Codex 官方服务</small>
       </div>
     </div>`;
+}
+
+function renderTokenValue(value: number | undefined, available: boolean): string {
+  if (!available || value === undefined) return "—";
+  return formatTokenSummary(value);
+}
+
+function renderTokenTableCell(value: number | undefined, available: boolean): string {
+  if (!available || value === undefined) return '<td aria-label="暂无数据">—</td>';
+  const formatted = formatTokenSummary(value);
+  return `<td title="${formatted}">${formatted}</td>`;
+}
+
+function renderTokenUsage(): string {
+  const data = tokenSnapshot;
+  const available = Boolean(data?.sourceAvailable);
+  const recent = data?.recentTurn ?? null;
+  const today = data?.today;
+  const session = data?.currentSession ?? null;
+  const stateCopy = tokenError
+    ? "Token 统计暂时无法读取"
+    : tokenLoading && !data
+      ? "正在读取本机统计"
+      : !available
+        ? "尚未发现本机 Codex 会话记录"
+        : recent?.active
+          ? "最近一轮仍在进行"
+          : "仅保留本机 token 数字，不解析或保存对话内容";
+
+  return `
+    <section class="token-card" aria-label="Token 用量">
+      <div class="token-card-head">
+        <div><span class="token-mark">${icon("tokens")}</span><strong>Token 用量</strong></div>
+        <button class="token-detail-button" data-action="token-details" aria-expanded="${tokenDetailsOpen}" aria-controls="token-details">
+          ${tokenDetailsOpen ? "收起明细" : "查看明细"}
+        </button>
+      </div>
+      <div class="token-summary-grid" aria-label="Token 用量摘要">
+        <div class="token-stat">
+          <span>最近一轮${recent?.active ? '<i aria-label="进行中"></i>' : ""}</span>
+          <strong title="${recent ? formatTokenSummary(recent.totalTokens) : "暂无数据"}">${renderTokenValue(recent?.totalTokens, available)}</strong>
+        </div>
+        <div class="token-stat">
+          <span>今日累计</span>
+          <strong title="${today ? formatTokenSummary(today.totalTokens) : "暂无数据"}">${renderTokenValue(today?.totalTokens, available)}</strong>
+        </div>
+        <div class="token-stat">
+          <span>当前会话</span>
+          <strong title="${session ? formatTokenSummary(session.totalTokens) : "暂无数据"}">${renderTokenValue(session?.totalTokens, available)}</strong>
+        </div>
+      </div>
+      ${tokenDetailsOpen ? `
+        <div class="token-details" id="token-details">
+          <table>
+            <caption>Token 分类明细</caption>
+            <thead><tr><th scope="col">分类</th><th scope="col">本轮</th><th scope="col">今日</th><th scope="col">会话</th></tr></thead>
+            <tbody>
+              <tr><th scope="row">输入</th>${renderTokenTableCell(recent?.inputTokens, available)}${renderTokenTableCell(today?.inputTokens, available)}${renderTokenTableCell(session?.inputTokens, available)}</tr>
+              <tr><th scope="row">缓存</th>${renderTokenTableCell(recent?.cachedInputTokens, available)}${renderTokenTableCell(today?.cachedInputTokens, available)}${renderTokenTableCell(session?.cachedInputTokens, available)}</tr>
+              <tr><th scope="row">输出</th>${renderTokenTableCell(recent?.outputTokens, available)}${renderTokenTableCell(today?.outputTokens, available)}${renderTokenTableCell(session?.outputTokens, available)}</tr>
+              <tr><th scope="row">推理</th>${renderTokenTableCell(recent?.reasoningOutputTokens, available)}${renderTokenTableCell(today?.reasoningOutputTokens, available)}${renderTokenTableCell(session?.reasoningOutputTokens, available)}</tr>
+              <tr class="token-total-row"><th scope="row">总计</th>${renderTokenTableCell(recent?.totalTokens, available)}${renderTokenTableCell(today?.totalTokens, available)}${renderTokenTableCell(session?.totalTokens, available)}</tr>
+            </tbody>
+          </table>
+        </div>` : ""}
+      <p class="token-note${tokenError ? " token-error" : ""}" role="${tokenError ? "status" : "note"}">${stateCopy}</p>
+    </section>`;
 }
 
 function render(): void {
@@ -418,6 +554,8 @@ function render(): void {
           <p>${status.detail}</p>
           ${!loading ? '<button class="text-button" data-action="refresh">重新尝试</button>' : ""}
         </div>`}
+
+      ${renderTokenUsage()}
 
       <footer>
         <div class="updated" title="${status.detail}">
@@ -499,6 +637,48 @@ function normalizeSnapshot(value: unknown): UsageSnapshot {
     throw new Error("用量数据不完整");
   }
   return candidate;
+}
+
+function normalizeTokenSnapshot(value: unknown): TokenUsageSnapshot {
+  if (!value || typeof value !== "object") throw new Error("Codex 返回了无效 Token 数据");
+  const candidate = value as TokenUsageSnapshot;
+  const periods = [candidate.recentTurn, candidate.today, candidate.currentSession].filter(Boolean) as TokenUsageBreakdown[];
+  if (periods.some((item) => typeof item.totalTokens !== "number" || typeof item.inputTokens !== "number")) {
+    throw new Error("Token 用量数据不完整");
+  }
+  return candidate;
+}
+
+async function refreshTokenUsage(): Promise<void> {
+  if (tokenRefreshing) return;
+  if (!isTauri) {
+    tokenSnapshot = { ...mockTokenSnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
+    tokenError = "";
+    render();
+    return;
+  }
+
+  tokenRefreshing = true;
+  tokenLoading = !tokenSnapshot;
+  tokenError = "";
+  try {
+    const dayStart = new Date();
+    dayStart.setHours(0, 0, 0, 0);
+    tokenSnapshot = normalizeTokenSnapshot(await invoke("read_token_usage", {
+      dayStartIso: dayStart.toISOString(),
+      dayStartUnix: Math.floor(dayStart.getTime() / 1000),
+    }));
+  } catch (error) {
+    tokenError = error instanceof Error ? error.message : String(error);
+  } finally {
+    tokenLoading = false;
+    tokenRefreshing = false;
+    render();
+  }
+}
+
+async function refreshAllUsage(): Promise<void> {
+  await Promise.all([refreshUsage(), refreshTokenUsage()]);
 }
 
 async function refreshUsage(): Promise<void> {
@@ -880,7 +1060,12 @@ app.addEventListener("click", async (event) => {
   if (!button) return;
   switch (button.dataset.action) {
     case "refresh":
-      await refreshUsage();
+      await refreshAllUsage();
+      break;
+    case "token-details":
+      tokenDetailsOpen = !tokenDetailsOpen;
+      render();
+      app.querySelector<HTMLButtonElement>('[data-action="token-details"]')?.focus();
       break;
     case "settings":
       settingsOpen = !settingsOpen;
@@ -907,7 +1092,7 @@ if (isTauri) {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") void invoke("hide_panel").catch(() => undefined);
   });
-  void listen("usage://refresh-requested", () => void refreshUsage());
+  void listen("usage://refresh-requested", () => void refreshAllUsage());
   void listen("settings://open", () => {
     settingsOpen = true;
     render();
@@ -917,7 +1102,7 @@ if (isTauri) {
     applyPanelPosition();
   });
   void initializeAutostart();
-  void initializeRuntimePlatform().then(() => refreshUsage());
+  void initializeRuntimePlatform().then(() => refreshAllUsage());
 } else {
   void updateTrayIcon(mockSnapshot);
 }
@@ -936,6 +1121,7 @@ window.setInterval(() => {
 }, 30_000);
 
 window.setInterval(() => void refreshUsage(), 60_000);
+window.setInterval(() => void refreshTokenUsage(), 15_000);
 
 themeQuery.addEventListener("change", () => {
   void updateTrayIcon(snapshot);

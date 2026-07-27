@@ -57,10 +57,12 @@ initialize
 - 根据 `windowDurationMins` 识别 5 小时和每周窗口，不依赖返回数组顺序。
 - 套餐类型优先采用实时 rate limits 响应，避免显示过期账户信息。
 - `resetsAt` 按 Unix 秒解析，并使用系统时区显示。
+- Token 摘要来自本机 Codex 会话文件中的独立 `token_count` 事件，通过累计值差分计算最近一轮、今日累计和当前会话。
 
 ## 隐私与安全边界
 
 - 不读取或复制 `~/.codex/auth.json`。
+- 读取 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 时只解析相关事件的类型、时间戳和 token 数字，不解析或保存提示词、回复与代码内容。
 - 不保存 OpenAI access token、refresh token 或浏览器 Cookie。
 - 不直接调用未公开的 `chatgpt.com/backend-api/wham/usage`。
 - 登录和令牌刷新完全交给用户已安装的 Codex CLI/App Server。

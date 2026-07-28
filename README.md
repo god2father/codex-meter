@@ -13,6 +13,12 @@ Codex Meter 是一款面向 Windows 系统托盘和 macOS 菜单栏的轻量 Cod
 
 Windows 版本已验证生产构建、单实例、右键菜单、深色模式、窄尺寸布局和基础交互。macOS 仍需在真实 Mac 上验证菜单栏定位、Retina 缩放、Vibrancy 效果和应用签名。
 
+## macOS 界面预览
+
+![Codex Meter macOS 菜单栏界面预览](docs/images/macos-interface-preview.jpg)
+
+> 使用项目内置演示数据生成，用于展示菜单栏面板界面；macOS 实机效果仍以真机验收为准。
+
 ## 主要功能
 
 - 显示 Codex 5 小时和每周用量窗口。

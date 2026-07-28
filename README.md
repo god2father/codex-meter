@@ -126,6 +126,14 @@ npm run tauri -- build --bundles app,dmg
 
 构建完成后，可在 GitHub 仓库的 **Actions → 对应运行记录 → Artifacts** 下载，产物保留 14 天。
 
+## Code signing policy
+
+本项目计划通过 SignPath Foundation 为开源版本提供免费代码签名。签名流程、团队职责和隐私声明见 [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)。
+
+## 开源许可证
+
+本项目采用 [MIT License](LICENSE)。
+
 ## 验证命令
 
 ```text

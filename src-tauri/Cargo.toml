@@ -3,6 +3,7 @@ name = "codex-meter"
 version = "0.3.0"
 description = "A tiny Codex usage tray app"
 edition = "2021"
+license = "MIT"
 
 [lib]
 name = "codex_meter_lib"

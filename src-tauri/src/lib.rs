@@ -43,6 +43,12 @@ struct PanelPosition {
     edge: PanelEdge,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PanelResizeResult {
+    constrained: bool,
+}
+
 #[tauri::command]
 async fn refresh_usage(state: State<'_, AppState>) -> Result<UsageSnapshot, String> {
     let service = Arc::clone(&state.0);
@@ -122,15 +128,29 @@ fn hide_panel(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn resize_panel(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), String> {
-    if !(280..=480).contains(&width) || !(180..=800).contains(&height) {
+fn resize_panel(
+    app: tauri::AppHandle,
+    width: u32,
+    height: u32,
+) -> Result<PanelResizeResult, String> {
+    if !(280..=480).contains(&width) || !(180..=1600).contains(&height) {
         return Err("Panel dimensions are outside the supported range".into());
     }
     let window = app
         .get_webview_window("main")
         .ok_or("Main window is unavailable")?;
+    let maximum_height = window
+        .current_monitor()
+        .map_err(|error| error.to_string())?
+        .map(|monitor| {
+            (monitor.work_area().size.height as f64 / monitor.scale_factor()).floor() as u32
+        })
+        .unwrap_or(height)
+        .saturating_sub(4)
+        .max(180);
+    let actual_height = height.min(maximum_height);
     window
-        .set_size(LogicalSize::new(width as f64, height as f64))
+        .set_size(LogicalSize::new(width as f64, actual_height as f64))
         .map_err(|error| error.to_string())?;
 
     let anchor = app
@@ -142,7 +162,9 @@ fn resize_panel(app: tauri::AppHandle, width: u32, height: u32) -> Result<(), St
     if let Some(anchor) = anchor {
         position_near_tray(&app, &window, &anchor);
     }
-    Ok(())
+    Ok(PanelResizeResult {
+        constrained: actual_height < height,
+    })
 }
 
 fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {

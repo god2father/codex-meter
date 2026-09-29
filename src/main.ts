@@ -59,6 +59,10 @@ interface PanelPosition {
   edge: "top" | "bottom" | "left" | "right";
 }
 
+interface PanelResizeResult {
+  constrained: boolean;
+}
+
 declare global {
   interface Window {
     __TAURI_INTERNALS__?: unknown;
@@ -625,7 +629,14 @@ function schedulePanelSync(): void {
     const nextSize = `${width}x${height}`;
     if (nextSize === lastPanelSize) return;
     lastPanelSize = nextSize;
-    void invoke("resize_panel", { width, height }).catch(() => undefined);
+    void invoke<PanelResizeResult>("resize_panel", { width, height })
+      .then(({ constrained }) => {
+        document.documentElement.dataset.panelConstrained = String(constrained);
+      })
+      .catch((error) => {
+        lastPanelSize = "";
+        console.error("无法调整用量面板尺寸", error);
+      });
   });
 }
 

@@ -10,6 +10,11 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(target_os = "windows")]
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "windows")]
@@ -68,7 +73,7 @@ impl RpcClient {
         }
 
         #[cfg(target_os = "windows")]
-        let help = "Codex Desktop 的 WindowsApps 内置程序不能作为外部 CLI 调用；请安装独立 Codex CLI 并登录，或把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
+        let help = "请安装并登录 Codex Desktop 或独立 Codex CLI，也可以把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
         #[cfg(not(target_os = "windows"))]
         let help = "请安装新版 ChatGPT/Codex 桌面程序或独立 Codex CLI 并登录，也可以把 CODEX_METER_CODEX_PATH 设为可执行文件路径";
 
@@ -260,7 +265,10 @@ fn codex_candidates() -> Vec<String> {
         }
     }
     #[cfg(target_os = "windows")]
-    candidates.extend(["codex.exe".into(), "codex.cmd".into(), "codex".into()]);
+    {
+        candidates.extend(windows_desktop_codex_candidates());
+        candidates.extend(["codex.exe".into(), "codex.cmd".into(), "codex".into()]);
+    }
     #[cfg(target_os = "linux")]
     candidates.push("codex".into());
     #[cfg(target_os = "macos")]
@@ -271,6 +279,36 @@ fn codex_candidates() -> Vec<String> {
     ]);
 
     candidates
+}
+
+#[cfg(target_os = "windows")]
+fn windows_desktop_codex_candidates() -> Vec<String> {
+    let Ok(local_app_data) = env::var("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let bin_dir = Path::new(&local_app_data)
+        .join("OpenAI")
+        .join("Codex")
+        .join("bin");
+    let Ok(entries) = fs::read_dir(bin_dir) else {
+        return Vec::new();
+    };
+
+    let mut executables = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("codex.exe"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<PathBuf>>();
+    executables.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+    });
+    executables.reverse();
+    executables
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
 }
 
 #[derive(Debug, Serialize, PartialEq)]

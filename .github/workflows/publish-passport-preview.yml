@@ -50,4 +50,4 @@ jobs:
           test "$(find assets -type f | wc -l)" -eq 4
           (cd assets && sha256sum * > SHA256SUMS.txt)
           gh release upload v0.3.2 assets/* --clobber --repo "$REPO"
-          gh release edit v0.3.2 --repo "$REPO" --draft=false --prerelease --latest=false --target "$sha"
+          gh release edit v0.3.2 --repo "$REPO" --draft=false --prerelease --latest=false --target "$GITHUB_SHA"

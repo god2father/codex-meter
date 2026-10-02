@@ -373,6 +373,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let cert = root.join("cert.pem");
         let key = root.join("key.pem");
+        let openssl_config = root.join("openssl.cnf");
+        fs::write(&openssl_config, "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=ext\n[dn]\nCN=localhost\n[ext]\nsubjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n").unwrap();
         assert!(Command::new("openssl")
             .args([
                 "req",
@@ -385,13 +387,11 @@ mod tests {
                 "1",
                 "-subj",
                 "/CN=localhost",
-                "-addext",
-                "subjectAltName=IP:127.0.0.1",
-                "-addext",
-                "basicConstraints=critical,CA:FALSE",
                 "-keyout"
             ])
             .arg(&key)
+            .arg("-config")
+            .arg(&openssl_config)
             .arg("-out")
             .arg(&cert)
             .stdout(Stdio::null())

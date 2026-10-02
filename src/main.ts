@@ -12,6 +12,24 @@ type DataFreshness = "fresh" | "reconnecting" | "expired" | "loading" | "unavail
 type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "neutral";
 type RuntimePlatform = "windows" | "macos" | "other";
 
+interface PassportConfig { runtime: string; script: string; environmentFile: string }
+interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; message: string }
+let passport: PassportStatus = { config: { runtime: "", script: "", environmentFile: "" }, running: false, connected: false, message: "已关闭" };
+let passportBusy = false;
+let passportError = "";
+let passportEditing = false;
+function escapePassport(value: string): string {
+  return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
+}
+async function passportCommand(command: string, args?: Record<string, unknown>): Promise<void> {
+  if (passportBusy || !isTauri) return;
+  passportBusy = true;
+  passportError = "";
+  try { passport = await invoke<PassportStatus>(command, args); }
+  catch (error) { passportError = String(error); }
+  finally { passportBusy = false; render(); }
+}
+
 interface LimitWindow {
   usedPercent: number;
   remainingPercent?: number;
@@ -587,6 +605,22 @@ function render(): void {
             <span class="switch" aria-hidden="true"><i></i></span>
           </label>
         </div>
+        <div class="passport-settings">
+          <label class="setting-row setting-toggle">
+            <span class="setting-copy"><span>Passport Bridge</span><small>手动开启局域网连接</small></span>
+            <input type="checkbox" data-setting="passport" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri || !passport.config.environmentFile ? "disabled" : ""}>
+            <span class="switch" aria-hidden="true"><i></i></span>
+          </label>
+          <p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>
+          <button data-action="passport-config" ${passport.running || passportBusy ? "disabled" : ""}>${passportEditing ? "收起配置" : "配置 Bridge"}</button>
+          ${passportEditing ? `<form id="passport-config" class="passport-form">
+            <label>Node 运行时路径<input name="runtime" required value="${escapePassport(passport.config.runtime)}" placeholder="Node 可执行文件的绝对路径"></label>
+            <label>Bridge 脚本路径<input name="script" required value="${escapePassport(passport.config.script)}" placeholder="server.mjs 的绝对路径"></label>
+            <label>环境配置文件<input name="environmentFile" required value="${escapePassport(passport.config.environmentFile)}" placeholder="环境变量 JSON 文件的绝对路径"></label>
+            <button type="submit" ${passportBusy ? "disabled" : ""}>保存配置</button>
+            <p class="setting-note">首次绑定仍需 USB。每次启动 Meter 后手动开启；桌面审批同步仍属实验功能。</p>
+          </form>` : ""}
+        </div>
         ${autostartError ? `<p class="setting-note setting-error" role="status">设置失败：${autostartError}</p>` : `<p class="setting-note">${autostartLoading ? "正在读取系统启动设置…" : autostartEnabled ? "已加入系统登录项。" : "安装到固定位置后再开启。"}</p>`}
       </section>
       </div>` : ""}
@@ -1070,6 +1104,10 @@ app.addEventListener("click", async (event) => {
   const button = (event.target as Element).closest<HTMLButtonElement>("button[data-action]");
   if (!button) return;
   switch (button.dataset.action) {
+    case "passport-config":
+      passportEditing = !passportEditing;
+      render();
+      break;
     case "refresh":
       await refreshAllUsage();
       break;
@@ -1091,7 +1129,15 @@ app.addEventListener("click", async (event) => {
   }
 });
 
+app.addEventListener("submit", (event) => {
+  if (!(event.target instanceof HTMLFormElement) || event.target.id !== "passport-config") return;
+  event.preventDefault();
+  const data = new FormData(event.target);
+  void passportCommand("passport_configure", { config: { runtime: String(data.get("runtime")).trim(), script: String(data.get("script")).trim(), environmentFile: String(data.get("environmentFile")).trim() } });
+});
 app.addEventListener("change", (event) => {
+  const toggle = (event.target as Element).closest<HTMLInputElement>('input[data-setting="passport"]');
+  if (toggle) void passportCommand("passport_toggle", { enabled: toggle.checked });
   const input = (event.target as Element).closest<HTMLInputElement>('input[data-setting="autostart"]');
   if (input) void setAutostart(input.checked);
 });
@@ -1099,6 +1145,10 @@ app.addEventListener("change", (event) => {
 render();
 
 if (isTauri) {
+  void passportCommand("passport_status");
+  window.setInterval(() => {
+    if (settingsOpen && !passportEditing && !passportBusy) void passportCommand("passport_status");
+  }, 3000);
   document.addEventListener("contextmenu", (event) => event.preventDefault());
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") void invoke("hide_panel").catch(() => undefined);

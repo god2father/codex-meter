@@ -1,4 +1,6 @@
 mod codex;
+mod passport;
+use passport::{passport_configure, passport_status, passport_toggle, PassportState};
 mod token_usage;
 
 use codex::{CodexService, UsageSnapshot};
@@ -591,6 +593,7 @@ pub fn run() {
             None,
         ))
         .manage(AppState(Arc::new(Mutex::new(CodexService::new()))))
+        .manage(PassportState::default())
         .manage(TrayAnchorState(Mutex::new(None)))
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -600,7 +603,9 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "显示用量", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &refresh, &quit])?;
+            let settings =
+                MenuItem::with_id(app, "settings", "设置 / Passport", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &refresh, &settings, &quit])?;
 
             TrayIconBuilder::with_id("usage")
                 .icon(neutral_icon())
@@ -619,6 +624,9 @@ pub fn run() {
                     }
                     "refresh" => {
                         let _ = app.emit("usage://refresh-requested", ());
+                    }
+                    "settings" => {
+                        let _ = open_settings(app.clone());
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -658,6 +666,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
+            passport_status,
+            passport_configure,
+            passport_toggle,
             read_token_usage,
             runtime_platform,
             update_tray_icon,
@@ -670,6 +681,11 @@ pub fn run() {
         .expect("failed to build Codex Meter");
 
     app.run(|app, event| {
+        if matches!(event, RunEvent::Exit) {
+            if let Ok(mut bridge) = app.state::<PassportState>().0.lock() {
+                let _ = bridge.stop();
+            }
+        }
         if let RunEvent::WindowEvent { label, event, .. } = event {
             if label == "main" {
                 match event {

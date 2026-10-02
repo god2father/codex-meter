@@ -625,3 +625,9 @@ footer { justify-content: space-between; min-height: 30px; margin-top: 5px; padd
   *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
   .hero-track i::before, .window-track i::before { animation: none !important; }
 }
+
+.passport-settings { border-top: 1px solid rgba(128, 128, 128, .2); margin-top: 10px; padding-top: 8px; }
+.passport-form { display: grid; gap: 8px; margin-top: 10px; }
+.passport-form label { display: grid; gap: 4px; font-size: 12px; }
+.passport-form input { width: 100%; box-sizing: border-box; padding: 7px; border: 1px solid #8194a466; border-radius: 6px; background: transparent; color: inherit; }
+.passport-settings button { padding: 6px 10px; border-radius: 6px; border: 1px solid #8194a466; color: inherit; background: transparent; cursor: pointer; }

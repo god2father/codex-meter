@@ -72,6 +72,7 @@ jobs:
           cp "$mac_intel_dmg" "release-assets/Codex-Meter_${version}_macOS-Intel.dmg"
 
           test "$(find release-assets -maxdepth 1 -type f | wc -l)" -eq 4
+          (cd release-assets && sha256sum * > SHA256SUMS.txt)
           ls -lh release-assets
 
       - name: 创建或更新 Release

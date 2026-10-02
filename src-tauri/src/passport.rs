@@ -238,10 +238,17 @@ fn toggle(state: Arc<Mutex<Bridge>>, enabled: bool) -> Result<Status, String> {
     let cert = reqwest::Certificate::from_pem(&cert).map_err(|_| "无效 TLS 证书")?;
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
+        .tls_built_in_root_certs(false)
         .add_root_certificate(cert)
         .timeout(Duration::from_millis(700))
         .build()
-        .map_err(|_| "无法创建安全状态连接")?;
+        .map_err(|error| {
+            #[cfg(test)]
+            eprintln!("TLS client initialization failed: {error:?}");
+            #[cfg(not(test))]
+            let _ = error;
+            "无法创建安全状态连接"
+        })?;
     let mut command = Command::new(&bridge.config.runtime);
     // Do not inherit Passport configuration from Meter's launch environment.
     for (key, _) in std::env::vars_os() {
@@ -370,6 +377,7 @@ mod tests {
             .args([
                 "req",
                 "-x509",
+                "-sha256",
                 "-newkey",
                 "rsa:2048",
                 "-nodes",

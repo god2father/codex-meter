@@ -1,16 +1,19 @@
 import { randomUUID } from 'node:crypto';
 
-function boundedText(text, bytes) {
-  let result = '';
+function textChunks(text, bytes) {
+  const chunks = [];
+  let result = '', length = 0;
   for (const char of String(text ?? '')) {
     const code = char.codePointAt(0);
     const printable = char === '\n' || code >= 0x20 && code <= 0x7e ||
       code >= 0x3000 && code <= 0x303f || code >= 0x4e00 && code <= 0x9fff || code >= 0xff00 && code <= 0xffef;
     const next = printable ? char : '?';
-    if (Buffer.byteLength(result + next) > bytes - 3) return result + '...';
-    result += next;
+    const size = Buffer.byteLength(next);
+    if (length + size > bytes) { chunks.push(result); result = ''; length = 0; }
+    result += next; length += size;
   }
-  return result;
+  if (result) chunks.push(result);
+  return chunks;
 }
 
 export function historyMessages(state) {
@@ -19,9 +22,9 @@ export function historyMessages(state) {
     ['userMessage', 'steeringUserMessage', 'agentMessage'].includes(item?.type)).map(item => {
       const text = item.type === 'agentMessage' ? item.text :
         (Array.isArray(item.content) ? item.content : []).filter(part => part?.type === 'text').map(part => part.text).join('\n');
-      return { ...item, body: typeof text === 'string' ? text.trim() : '' };
-    }).filter(item => item.body && !/^<(environment_context|heartbeat|external_codex_apps_open_page)>/.test(item.body));
-  return messages.map(item => ({ role: item.type === 'agentMessage' ? 'assistant' : 'user', text: boundedText(item.body, 450) }));
+      return { ...item, body: typeof text === 'string' ? text : '' };
+    }).filter(item => item.body.trim() && !/^<(environment_context|heartbeat|external_codex_apps_open_page)>/.test(item.body.trimStart()));
+  return messages.flatMap(item => textChunks(item.body, 450).map(text => ({ role: item.type === 'agentMessage' ? 'assistant' : 'user', text })));
 }
 
 export function chatMessages(state) {

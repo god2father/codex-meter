@@ -8,9 +8,6 @@ import {
 import "./style.css";
 
 let pairingCode = "";
-interface PendingEnrollment { requestId: string; fingerprint: string; address: string; expiresAt: number }
-let pairingPending: PendingEnrollment | null = null;
-let pairingCompared = false;
 let pairingExpiresAt = 0;
 let pairingError = "";
 let pairingBusy = false;
@@ -488,9 +485,8 @@ function renderSettings(): string {
       <button class="setting-row setting-button" data-action="passport-bind" ${passportBusy || !isTauri ? "disabled" : ""}><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>${pairingBusy ? "正在准备…" : pairingCode ? "刷新绑定码" : "绑定设备"}</span><small>手机页面输入绑定码，完成无线连接</small></span></span>${icon("chevron")}</button>
     </div>
     <p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>
-    ${pairingPending ? `<div class="pairing-confirm"><strong>确认连接这台 Passport</strong><p class="setting-note">请核对下方标识与手机页面一致。设备地址：${escapePassport(pairingPending.address)}</p><div class="pairing-code">${escapePassport(pairingPending.fingerprint.match(/.{1,4}/g)!.join("-"))}</div><label class="setting-note"><input type="checkbox" id="pairing-compared" ${pairingCompared ? "checked" : ""}> 已核对手机与电脑标识一致</label><div class="pairing-actions"><button class="text-button" data-action="passport-approve" ${!pairingCompared || passportBusy ? "disabled" : ""}>确认绑定</button><button class="text-button" data-action="passport-reject" ${passportBusy ? "disabled" : ""}>拒绝</button></div></div>` : ""}
     ${pairingError ? `<p class="inline-error" role="alert">${escapePassport(pairingError)}</p>` : ""}
-    ${pairingCode ? `<div class="pairing-code pairing-code--pin" aria-label="电脑绑定码">${escapePassport(pairingCode)}</div><p class="setting-note">手机加入 Passport 热点，在自动打开的配网页面填写此码，再选择与电脑相同的 Wi-Fi。验证通过后，在设备上确认保存。绑定码有效期 5 分钟；提交后核对两端验证标识，并在电脑确认。</p><button class="text-button" data-action="passport-hide-code">收起绑定码</button>` : ""}
+    ${pairingCode ? `<div class="pairing-code pairing-code--pin" aria-label="电脑绑定码">${escapePassport(pairingCode)}</div><p class="setting-note">手机加入 Passport 热点，在自动打开的配网页面填写此码，再选择与电脑相同的 Wi-Fi。验证通过后，在设备上确认保存。绑定码有效期 5 分钟，电脑会自动验证，无需在 Meter 上确认。</p><button class="text-button" data-action="passport-hide-code">收起绑定码</button>` : ""}
     <p class="settings-footnote">Bridge 默认关闭。配网与电脑绑定均通过手机完成，无需 USB。</p>
   </section>`;
 }
@@ -1086,21 +1082,6 @@ app.addEventListener("click", async (event) => {
     case "passport-bind":
       await generatePairing();
       break;
-    case "passport-approve":
-    case "passport-reject": {
-      if (!pairingPending || (button.dataset.action === "passport-approve" && !pairingCompared)) break;
-      if (passportBusy) break;
-      passportBusy = true; ++passportRevision; render();
-      try {
-        const accepted = button.dataset.action === "passport-approve";
-        await invoke("passport_enrollment_decide", { requestId: pairingPending.requestId, accepted });
-        pairingPending = null; pairingCompared = false;
-        if (!accepted) { pairingCode = ""; pairingExpiresAt = 0; pairingError = "已拒绝绑定，请重新生成绑定码。"; }
-      }
-      catch (error) { pairingError = String(error); }
-      finally { passportBusy = false; render(); }
-      break;
-    }
     case "passport-hide-code":
       pairingCode = "";
       render();
@@ -1183,7 +1164,7 @@ themeQuery.addEventListener("change", () => {
 
 async function generatePairing(): Promise<void> {
   if (passportBusy || !isTauri) return;
-  passportBusy = true; ++passportRevision; pairingBusy = true; pairingError = ""; pairingCode = ""; pairingPending = null; pairingCompared = false; render();
+  passportBusy = true; ++passportRevision; pairingBusy = true; pairingError = ""; pairingCode = ""; render();
   try {
     const value = await invoke<{ code: string; expiresAt: number }>("passport_enrollment");
     pairingCode = value.code; pairingExpiresAt = value.expiresAt;
@@ -1192,16 +1173,3 @@ async function generatePairing(): Promise<void> {
   } catch (error) { pairingError = String(error); }
   finally { passportBusy = false; pairingBusy = false; render(); }
 }
-
-app.addEventListener("change", event => { if ((event.target as HTMLInputElement).id === "pairing-compared") { pairingCompared = (event.target as HTMLInputElement).checked; render(); } });
-let enrollmentPolling = false;
-window.setInterval(async () => {
-    if (!isTauri || enrollmentPolling || passportBusy) return;
-    enrollmentPolling = true;
-    const revision = passportRevision;
-    try {
-        const pending = await invoke<PendingEnrollment | null>("passport_enrollment_status");
-        if (revision === passportRevision && pending?.requestId !== pairingPending?.requestId) { pairingPending = pending; pairingCompared = false; render(); }
-    } catch { /* Keep connection polling independent from binding UI. */ }
-    finally { enrollmentPolling = false; }
-}, 1500);

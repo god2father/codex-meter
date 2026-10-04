@@ -3,8 +3,8 @@ mod codex;
 mod macos_tray;
 mod passport;
 use passport::{
-    passport_configure, passport_enrollment, passport_enrollment_decide,
-    passport_enrollment_status, passport_pairing, passport_status, passport_toggle, PassportState,
+    passport_configure, passport_enrollment, passport_pairing, passport_status, passport_toggle,
+    PassportState,
 };
 mod token_usage;
 
@@ -795,8 +795,6 @@ pub fn run() {
             passport_status,
             passport_pairing,
             passport_enrollment,
-            passport_enrollment_status,
-            passport_enrollment_decide,
             passport_configure,
             passport_toggle,
             read_token_usage,

@@ -303,27 +303,9 @@ mod tests {
             );
         }
         let previous_session = payload["sessionId"].clone();
-        let pending = serde_json::json!({ "sessionId": previous_session, "requestId": "a".repeat(32), "fingerprint": "ABCD1234ABCD1234", "address": "192.168.1.10", "expiresAt": first.expires_at });
-        replace_private(
-            &file.with_file_name("pending-enrollment.json"),
-            &serde_json::to_vec(&pending).unwrap(),
-        )
-        .unwrap();
-        let pending_path = file.with_file_name("pending-enrollment.json");
-        let mut expired = pending.clone();
-        expired["expiresAt"] = serde_json::json!(now - 1);
-        replace_private(&pending_path, &serde_json::to_vec(&expired).unwrap()).unwrap();
-        assert!(enrollment_status(&config).unwrap().is_none());
-        assert!(enrollment_decide(&config, &"a".repeat(32), true).is_err());
-        replace_private(&pending_path, &serde_json::to_vec(&pending).unwrap()).unwrap();
-        assert!(enrollment_status(&config).unwrap().is_some());
-        assert!(enrollment_decide(&config, &"b".repeat(32), true).is_err());
-        enrollment_decide(&config, &"a".repeat(32), true).unwrap();
-        assert!(enrollment_status(&config).unwrap().is_none());
         let _ = enrollment(&config, &address).unwrap();
         let fresh: serde_json::Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
         assert_ne!(fresh["sessionId"], previous_session);
-        assert!(enrollment_status(&config).unwrap().is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -500,79 +482,4 @@ pub fn enrollment(config: &Config, address: &str) -> Result<Enrollment, String> 
         &serde_json::to_vec(&payload).map_err(|_| "无法编码绑定信息")?,
     )?;
     Ok(Enrollment { code, expires_at })
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingEnrollment {
-    pub request_id: String,
-    pub fingerprint: String,
-    pub address: String,
-    pub expires_at: u64,
-}
-pub fn enrollment_status(config: &Config) -> Result<Option<PendingEnrollment>, String> {
-    if config.environment_file.is_empty() {
-        return Ok(None);
-    }
-    let env = environment(&config.environment_file)?;
-    let Some(file) = env.get("PASSPORT_ENROLLMENT_FILE") else {
-        return Ok(None);
-    };
-    let active: serde_json::Value = match fs::read(file)
-        .ok()
-        .and_then(|s| serde_json::from_slice(&s).ok())
-    {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let pending_file = Path::new(file).with_file_name("pending-enrollment.json");
-    let pending: serde_json::Value = match fs::read(pending_file)
-        .ok()
-        .and_then(|s| serde_json::from_slice(&s).ok())
-    {
-        Some(v) => v,
-        None => return Ok(None),
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "系统时间无效")?
-        .as_millis() as u64;
-    if active["sessionId"] != pending["sessionId"]
-        || active["expiresAt"].as_u64().unwrap_or(0) <= now
-        || pending["expiresAt"].as_u64().unwrap_or(0) <= now
-        || active["approvedRequestId"] == pending["requestId"]
-        || active["rejectedRequestId"] == pending["requestId"]
-    {
-        return Ok(None);
-    }
-    let request: PendingEnrollment = serde_json::from_value(pending).map_err(|_| "无效绑定请求")?;
-    if request.request_id.len() != 32
-        || !request.request_id.bytes().all(|c| c.is_ascii_hexdigit())
-        || request.fingerprint.len() != 16
-        || !request.fingerprint.bytes().all(|c| c.is_ascii_hexdigit())
-        || request.address.parse::<Ipv4Addr>().is_err()
-    {
-        return Err("无效绑定请求".into());
-    }
-    Ok(Some(request))
-}
-pub fn enrollment_decide(config: &Config, request_id: &str, accepted: bool) -> Result<(), String> {
-    let pending = enrollment_status(config)?.ok_or("绑定请求已过期，请重新绑定")?;
-    if pending.request_id != request_id {
-        return Err("绑定请求已变化，请重新核对".into());
-    }
-    let env = environment(&config.environment_file)?;
-    let file = &env["PASSPORT_ENROLLMENT_FILE"];
-    let mut active: serde_json::Value =
-        serde_json::from_slice(&fs::read(file).map_err(|_| "绑定码已过期")?)
-            .map_err(|_| "无效绑定配置")?;
-    active[if accepted {
-        "approvedRequestId"
-    } else {
-        "rejectedRequestId"
-    }] = serde_json::Value::String(request_id.into());
-    replace_private(
-        Path::new(file),
-        &serde_json::to_vec(&active).map_err(|_| "无法确认绑定")?,
-    )
 }

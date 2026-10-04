@@ -633,30 +633,3 @@ pub async fn passport_enrollment(
     .await
     .map_err(|_| "无法准备设备绑定")?
 }
-
-#[tauri::command]
-pub async fn passport_enrollment_status(
-    state: State<'_, PassportState>,
-) -> Result<Option<managed::PendingEnrollment>, String> {
-    let state = Arc::clone(&state.0);
-    tauri::async_runtime::spawn_blocking(move || {
-        let bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
-        managed::enrollment_status(&bridge.config)
-    })
-    .await
-    .map_err(|_| "无法读取绑定请求")?
-}
-#[tauri::command]
-pub async fn passport_enrollment_decide(
-    state: State<'_, PassportState>,
-    request_id: String,
-    accepted: bool,
-) -> Result<(), String> {
-    let state = Arc::clone(&state.0);
-    tauri::async_runtime::spawn_blocking(move || {
-        let bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
-        managed::enrollment_decide(&bridge.config, &request_id, accepted)
-    })
-    .await
-    .map_err(|_| "无法确认设备绑定")?
-}

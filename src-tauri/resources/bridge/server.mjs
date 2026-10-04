@@ -180,9 +180,24 @@ ws.on('connection', client => {
   void refreshContent();
   client.on('message', async raw => {
     let chatRequestId;
+    let historyThreadId;
     try {
       const m = JSON.parse(raw.toString());
       if (m.type === 'ready') { if (desktop) replayDesktop(); publish(); return; }
+      if (m.type === 'history') {
+        if (!Number.isInteger(m.requestId) || m.requestId < 0 || m.requestId > 0xffffffff) throw new Error('Invalid history request');
+        chatRequestId = m.requestId;
+        historyThreadId = typeof m.threadId === 'string' && m.threadId.length < 64 ? m.threadId : '';
+        if (!desktop || !contentReader || app.closed || selectingChat || queue.current() ||
+            !historyThreadId || historyThreadId !== app.threadId) throw new Error('History unavailable');
+        const generation = app.generation, deviceVersion = deviceGeneration;
+        const page = await contentReader.history(historyThreadId, m.page, m.revision ?? '');
+        if (device !== client || deviceVersion !== deviceGeneration || generation !== app.generation || historyThreadId !== app.threadId) return;
+        if (queue.current()) throw new Error('Device busy');
+        const wire = encodeDeviceMessage({ type: 'history', threadId: historyThreadId, requestId: chatRequestId, ...page });
+        if (!wire) throw new Error('History frame too large');
+        client.send(wire); return;
+      }
       if (m.type === 'chats' && desktop && deviceChats) {
         if (!Number.isInteger(m.requestId) || m.requestId < 0 || m.requestId > 0xffffffff) throw new Error('Invalid chat request');
         chatRequestId = m.requestId;
@@ -210,10 +225,10 @@ ws.on('connection', client => {
       else if (m.type === 'decision') queue.decide(m);
       else throw new Error('Unsupported message');
       publish();
-    } catch { if (device === client && client.readyState === 1) { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求', ...(chatRequestId === undefined ? {} : { requestId: chatRequestId }) })); publish(); } }
+    } catch { if (device === client && client.readyState === 1) { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求', ...(chatRequestId === undefined ? {} : { requestId: chatRequestId }), ...(historyThreadId === undefined ? {} : { threadId: historyThreadId }) })); publish(); } }
   });
   client.on('error', () => client.terminate());
-  client.on('close', () => { if (device === client) { device = undefined; deviceChats?.invalidate(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
+  client.on('close', () => { if (device === client) { device = undefined; deviceChats?.invalidate(); contentReader?.invalidateHistory(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
 });
 let stopping = false;
 let reconnectTimer;
@@ -255,6 +270,7 @@ if (desktop) {
   session.threadId = app.threadId;
   session.threadTitle = savedChat?.title ?? titleFor(app.threadId);
   app.on('selected', threadId => {
+    contentReader.invalidateHistory();
     contentText = ''; contentMessages = []; contentReadAt = 0; contentVersion++; contentLive = false;
     queue.requests.clear(); session.threadId = threadId; session.turnId = null;
     session.threadTitle = selectedChatTitle ?? titleFor(threadId);

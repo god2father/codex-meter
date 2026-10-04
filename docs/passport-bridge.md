@@ -28,7 +28,11 @@ An unloaded desktop chat may remain waiting until opened.
 
 ## Message bubbles and synchronization
 
-The matched firmware renders the latest user and assistant text in distinct right-purple and left-mint bubbles, in chronological order. The Bridge sends role-tagged `messages` plus legacy `content`; oversized frames discard legacy content before role-tagged messages. Each body is bounded to 450 UTF-8 bytes. Tools, reasoning and empty text are excluded. Firmware can reconstruct its scrolling content from messages-only frames.
+The matched firmware renders the latest two text messages in distinct right-purple user and left-mint assistant bubbles, including consecutive messages of the same role. Bubbles omit role headings and short messages fit their text. The Bridge sends role-tagged `messages` plus legacy `content`; oversized frames discard legacy content before role-tagged messages. Each body is bounded to 450 UTF-8 bytes. Tools, reasoning and empty text are excluded. Firmware can reconstruct its scrolling content from messages-only frames.
+
+Authenticated `history` requests carry threadId, requestId, page and an optional revision. Page zero is the latest two messages. The first read freezes a snapshot and returns a revision; later requests use it without rereading history. Older out-of-range requests clamp to the oldest page. Responses include page, hasOlder, hasNewer and role-tagged messages. Thread/device generation checks discard stale responses, and approvals take priority. Busy or invalid requests return an explicit error. Disconnects and chat selection invalidate the snapshot. The computer retains at most 200002 filtered bounded messages; the device only retains its current page.
+
+UP at the top loads an older page at its bottom; DOWN at the bottom loads a newer page at its top. Page-zero return resumes live text. Live text does not override history. Loading/error indicators preserve existing text and retry remains available. The 450-byte message limit still applies to history.
 
 When IPC snapshots omit history, a separate read-only app-server calls `thread/read` with `includeTurns: true`, at most every ten seconds while connected and missing live text. It does not resume threads or start turns. Reads load history on the computer before extracting the two device messages, so desktop cost grows with history. Thread, connection and live-content generation checks reject stale responses. Read errors preserve existing content. Pending approvals/questions omit message bodies and take priority on the device.
 

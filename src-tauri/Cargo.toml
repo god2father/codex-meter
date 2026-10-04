@@ -1,6 +1,6 @@
 [package]
 name = "codex-meter"
-version = "0.3.2"
+version = "0.3.3"
 description = "A tiny Codex usage tray app"
 edition = "2021"
 license = "MIT"
@@ -20,6 +20,14 @@ tauri-plugin-autostart = "2"
 tauri-plugin-single-instance = "2"
 
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rcgen = "0.14"
+getrandom = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+window-vibrancy = "0.8.1"
+objc2 = "0.6"
+objc2-foundation = "0.3.2"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSButton", "NSControl", "NSEvent", "NSMenu", "NSStatusItem", "NSView"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

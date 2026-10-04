@@ -7,27 +7,47 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import "./style.css";
 
+let pairingCode = "";
+interface PendingEnrollment { requestId: string; fingerprint: string; address: string; expiresAt: number }
+let pairingPending: PendingEnrollment | null = null;
+let pairingCompared = false;
+let pairingExpiresAt = 0;
+let pairingError = "";
+let pairingBusy = false;
+
 type UsageStatus = "ok" | "limit_reached" | "unavailable" | "signed_out" | "api_key_unsupported" | "stale" | "error";
 type DataFreshness = "fresh" | "reconnecting" | "expired" | "loading" | "unavailable";
 type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "neutral";
 type RuntimePlatform = "windows" | "macos" | "other";
 
 interface PassportConfig { runtime: string; script: string; environmentFile: string }
-interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; message: string }
+interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; message: string }
 let passport: PassportStatus = { config: { runtime: "", script: "", environmentFile: "" }, running: false, connected: false, message: "已关闭" };
 let passportBusy = false;
+let passportReading = false;
+let passportRevision = 0;
 let passportError = "";
-let passportEditing = false;
+let lastView = "";
 function escapePassport(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 }
 async function passportCommand(command: string, args?: Record<string, unknown>): Promise<void> {
-  if (passportBusy || !isTauri) return;
-  passportBusy = true;
-  passportError = "";
-  try { passport = await invoke<PassportStatus>(command, args); }
-  catch (error) { passportError = String(error); }
-  finally { passportBusy = false; render(); }
+  const reading = command === "passport_status";
+  if (!isTauri || passportBusy || (reading && passportReading)) return;
+  const previous = JSON.stringify(passport);
+  const previousError = passportError;
+  const revision = reading ? passportRevision : ++passportRevision;
+  if (reading) passportReading = true;
+  else { passportBusy = true; passportError = ""; render(); }
+  try {
+    const status = await invoke<PassportStatus>(command, args);
+    if (revision === passportRevision) { passport = status; passportError = ""; }
+  } catch (error) { if (revision === passportRevision) passportError = String(error); }
+  finally {
+    if (reading) passportReading = false;
+    else passportBusy = false;
+    if (!reading || previous !== JSON.stringify(passport) || previousError !== passportError) render();
+  }
 }
 
 interface LimitWindow {
@@ -370,6 +390,7 @@ async function initializeRuntimePlatform(): Promise<void> {
   try {
     const platform = await invoke<string>("runtime_platform");
     runtimePlatform = platform === "windows" || platform === "macos" ? platform : "other";
+    document.documentElement.dataset.nativeGlass = (await invoke<boolean>("native_glass")) ? "liquid" : "legacy";
   } catch {
     runtimePlatform = "windows";
   }
@@ -393,8 +414,14 @@ async function setAutostart(enabled: boolean): Promise<void> {
   }
 }
 
-function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens"): string {
+function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens" | "device" | "link" | "arrow" | "back" | "chevron" | "laptop"): string {
   const paths = {
+    device: '<rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M9 6h6M10 17h4"/>',
+    link: '<path d="m10 13 4-4M8 16l-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M16 8l1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0"/>',
+    arrow: '<path d="M5 12h14m-5-5 5 5-5 5"/>',
+    back: '<path d="m14 6-6 6 6 6"/>',
+    chevron: '<path d="m8 10 4 4 4-4"/>',
+    laptop: '<rect x="4" y="4" width="16" height="12" rx="2"/><path d="M2 20h20M9 16l-1 4m7-4 1 4"/>',
     refresh: '<path d="M20 11a8.1 8.1 0 1 0 .1 4M20 4v7h-7"/>',
     settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
     exit: '<path d="M10 5H5v14h5M14 8l4 4-4 4M9 12h9"/>',
@@ -411,39 +438,61 @@ function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert
   return `<svg aria-hidden="true" viewBox="0 0 24 24">${paths[name]}</svg>`;
 }
 
-function renderWindowCard(item: LimitWindow): string {
-  const remaining = remainingOf(item);
-  return `
-    <div class="window-card" data-tone="${usageTone(remaining)}">
-      <div class="window-card-head">
-        <span class="window-name">${formatWindow(item.windowDurationMins)}</span>
-        <strong>${remaining}%</strong>
-      </div>
-      <div class="window-track" aria-hidden="true"><i style="width:${remaining}%"></i></div>
-      <span class="reset-time">${formatReset(item.resetsAt)}</span>
-    </div>`;
+function renderQuota(): string {
+  const data = snapshot;
+  const windows = [data?.primary, data?.secondary].filter(Boolean) as LimitWindow[];
+  const status = statusCopy();
+  return `<section class="quota-strip" aria-label="订阅剩余额度">
+    <div class="section-caption"><span>剩余额度</span><span>${data?.planType ? escapePassport(formatPlan(data.planType)) : "Codex"}${data?.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</span></div>
+    ${windows.length ? `<div class="quota-grid">${windows.map(item => {
+      const value = remainingOf(item);
+      return `<div class="quota-window" data-tone="${usageTone(value)}">
+        <div class="quota-heading"><span>${formatWindow(item.windowDurationMins)}</span><strong>${value}<small>%</small></strong></div>
+        <div class="quota-track" role="meter" aria-label="${formatWindow(item.windowDurationMins)}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
+        <span class="reset-time">${formatReset(item.resetsAt)}</span>
+      </div>`;
+    }).join("")}</div>` : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapePassport(status.label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
+  </section>`;
 }
 
-function renderResetCard(item: LimitWindow): string {
-  return `
-    <div class="window-card action-card" data-tone="${usageTone(remainingOf(item))}">
-      <span class="action-icon">${icon("clock")}</span>
-      <div>
-        <strong>${formatReset(item.resetsAt)}</strong>
-        <small>${formatWindow(item.windowDurationMins)} 窗口</small>
-      </div>
-    </div>`;
+function passportStateLabel(): string {
+  return passport.failed ? "启动失败" : passportError ? "连接异常" : passport.connected ? "设备已连接" : passport.running ? "等待设备" : "已关闭";
 }
 
-function renderUpdatedCard(fetchedAt: number): string {
-  return `
-    <div class="window-card action-card">
-      <span class="action-icon">${icon("refresh")}</span>
-      <div>
-        <strong>${formatUpdated(fetchedAt)}</strong>
-        <small>来自 Codex 官方服务</small>
-      </div>
-    </div>`;
+function renderPassport(): string {
+  const tone = passportError || passport.failed ? "error" : passport.connected ? "connected" : passport.running ? "waiting" : "offline";
+  const label = passportBusy ? "正在处理" : passportStateLabel();
+  return `<section class="passport-card passport-compact" data-connection="${tone}" aria-label="Passport 连接">
+    <div class="passport-inline">
+      <span class="caption-title">${icon("device")}Passport</span>
+      <span class="connection-pill" role="status"><i></i>${label}</span>
+      <label class="setting-toggle passport-switch"><input type="checkbox" data-setting="passport" aria-label="Passport 连接开关" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
+      <button class="icon-button" data-action="passport-setup" title="Passport 设置" aria-label="Passport 设置">${icon("settings")}</button>
+    </div>
+    ${passportError ? `<p class="inline-error" role="alert">${escapePassport(passportError)}</p>` : ""}
+  </section>`;
+}
+
+function renderSettings(): string {
+  return `<section id="settings-card" class="settings-content" aria-label="偏好设置">
+    <div class="section-caption"><span>通用</span><span>按你的方式工作</span></div>
+    <div class="settings-group">
+      <div class="setting-row"><span class="setting-label"><i>${icon("moon")}</i><span>外观</span></span><span class="setting-value">跟随系统</span></div>
+      <div class="setting-row"><span class="setting-label"><i>${icon("clock")}</i><span>额度刷新</span></span><span class="setting-value">每分钟</span></div>
+      <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>登录时启动</span><small>自动驻留托盘</small></span></span><input type="checkbox" data-setting="autostart" aria-label="登录时启动" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
+    </div>
+    ${autostartError ? `<p class="inline-error" role="alert">${escapePassport(autostartError)}</p>` : ""}
+    <div class="section-caption settings-caption"><span>Passport</span><span class="connection-pill" data-on="${passport.connected}"><i></i>${passportStateLabel()}</span></div>
+    <div class="settings-group">
+      <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>Bridge 连接</span><small>手动开启局域网服务</small></span></span><input type="checkbox" data-setting="passport" aria-label="Bridge 连接" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
+      <button class="setting-row setting-button" data-action="passport-bind" ${passportBusy || !isTauri ? "disabled" : ""}><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>${pairingBusy ? "正在准备…" : pairingCode ? "刷新绑定码" : "绑定设备"}</span><small>手机页面输入绑定码，完成无线连接</small></span></span>${icon("chevron")}</button>
+    </div>
+    <p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>
+    ${pairingPending ? `<div class="pairing-confirm"><strong>确认连接这台 Passport</strong><p class="setting-note">请核对下方标识与手机页面一致。设备地址：${escapePassport(pairingPending.address)}</p><div class="pairing-code">${escapePassport(pairingPending.fingerprint.match(/.{1,4}/g)!.join("-"))}</div><label class="setting-note"><input type="checkbox" id="pairing-compared" ${pairingCompared ? "checked" : ""}> 已核对手机与电脑标识一致</label><div class="pairing-actions"><button class="text-button" data-action="passport-approve" ${!pairingCompared || passportBusy ? "disabled" : ""}>确认绑定</button><button class="text-button" data-action="passport-reject" ${passportBusy ? "disabled" : ""}>拒绝</button></div></div>` : ""}
+    ${pairingError ? `<p class="inline-error" role="alert">${escapePassport(pairingError)}</p>` : ""}
+    ${pairingCode ? `<div class="pairing-code pairing-code--pin" aria-label="电脑绑定码">${escapePassport(pairingCode)}</div><p class="setting-note">手机加入 Passport 热点，在自动打开的配网页面填写此码，再选择与电脑相同的 Wi-Fi。验证通过后，在设备上确认保存。绑定码有效期 5 分钟；提交后核对两端验证标识，并在电脑确认。</p><button class="text-button" data-action="passport-hide-code">收起绑定码</button>` : ""}
+    <p class="settings-footnote">Bridge 默认关闭。配网与电脑绑定均通过手机完成，无需 USB。</p>
+  </section>`;
 }
 
 function renderTokenValue(value: number | undefined, available: boolean): string {
@@ -471,14 +520,14 @@ function renderTokenUsage(): string {
         ? "尚未发现本机 Codex 会话记录"
         : recent?.active
           ? "最近一轮仍在进行"
-          : "仅保留本机 token 数字，不解析或保存对话内容";
+          : "仅统计本机 Token，不读取对话内容";
 
   return `
     <section class="token-card" aria-label="Token 用量">
       <div class="token-card-head">
-        <div><span class="token-mark">${icon("tokens")}</span><strong>Token 用量</strong></div>
+        <div><span class="token-mark">${icon("tokens")}</span><strong>Token 统计</strong></div>
         <button class="token-detail-button" data-action="token-details" aria-expanded="${tokenDetailsOpen}" aria-controls="token-details">
-          ${tokenDetailsOpen ? "收起明细" : "查看明细"}
+          ${tokenDetailsOpen ? "收起" : "明细"}${icon("chevron")}
         </button>
       </div>
       <div class="token-summary-grid" aria-label="Token 用量摘要">
@@ -514,118 +563,38 @@ function renderTokenUsage(): string {
 }
 
 function render(): void {
-  const data = snapshot;
-  const tightest = data ? tightestWindow(data) : null;
-  const remaining = tightest ? remainingOf(tightest) : 0;
-  const hasUsageData = Boolean(data && tightest);
-  const reached = data?.status === "limit_reached";
   const freshness = dataFreshness();
+  const state = freshness === "fresh" ? snapshot?.status === "limit_reached" ? "error" : "ok" : freshness;
+  const view = settingsOpen ? "settings" : "home";
+  const changedView = view !== lastView;
+  lastView = view;
   lastRenderedFreshness = freshness;
   scheduleFreshnessExpiry();
-  const state = freshness === "loading"
-    ? "loading"
-    : freshness === "expired"
-      ? "expired"
-      : freshness === "reconnecting"
-        ? "reconnecting"
-        : !hasUsageData || reached
-          ? "error"
-          : "ok";
-  const status = statusCopy(freshness);
-  const windowCount = Number(Boolean(data?.primary)) + Number(Boolean(data?.secondary));
-  const footerCopy = footerStatusCopy(freshness);
-  const statusIcon = state === "ok" ? "shield" : state === "loading" ? "clock" : "alert";
-  const statusIndicator = state === "ok"
-    ? `<img class="status-cat" src="${statusCatImage("healthy")}" alt="" />`
-    : icon(statusIcon);
-
-  app.innerHTML = `
-    <div class="panel-shell">
-    <section class="glass-card main-card" data-state="${state}" aria-label="Codex 用量">
-      <div class="shine" aria-hidden="true"></div>
-      <header>
-        <div class="brand-line">
-          <span class="app-mark">${icon("app")}</span>
-          <h1>Codex Meter</h1>
-          ${!isTauri ? '<span class="mock-badge">演示数据</span>' : ""}
-        </div>
-        <div class="header-actions">
-          <button class="icon-button header-refresh" data-action="refresh" aria-label="立即刷新" title="立即刷新" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button>
-          <button class="icon-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="${settingsOpen}" aria-controls="settings-card">${icon("settings")}</button>
-        </div>
+  const focused = document.activeElement instanceof HTMLInputElement ? document.activeElement : null;
+  const focusId = focused?.id;
+  const selection = focused ? [focused.selectionStart, focused.selectionEnd] : null;
+  const scrollTop = app.querySelector<HTMLElement>(".panel-scroll")?.scrollTop ?? 0;
+  app.innerHTML = `<div class="panel-shell">
+    <section class="glass-card main-card" data-state="${state}" data-view="${view}" aria-label="Codex Meter">
+      <header class="panel-header">
+        <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${settingsOpen ? "你的桌面，按你的习惯" : "桌面连接 · 用量一览"}</span></div></div>
+        <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
-      <p class="status-line" role="status" aria-live="polite"><span class="status-icon">${statusIndicator}</span><span>${status.label}</span></p>
-
-      ${data && tightest ? `
-        <div class="usage-hero" data-tone="${usageTone(remaining)}">
-          <span class="hero-label">剩余用量</span>
-          <div class="hero-meter" role="img" aria-label="最紧张窗口剩余 ${remaining}%">
-            <strong>${remaining}<small>%</small></strong>
-            <div class="hero-track" aria-hidden="true"><i style="width:${remaining}%"></i></div>
-          </div>
-          <p class="hero-meta">${data.planType ? `${formatPlan(data.planType)} 计划` : "当前账户"}${data.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</p>
-          <p class="usage-quip">${usageQuip(remaining)}</p>
-        </div>
-        <div class="window-grid" aria-label="用量窗口">
-          ${windowCount === 1 && tightest ? renderResetCard(tightest) : data.primary ? renderWindowCard(data.primary) : ""}
-          ${windowCount === 1 ? renderUpdatedCard(data.fetchedAt) : data.secondary ? renderWindowCard(data.secondary) : ""}
-        </div>` : `
-        <div class="empty-state" role="status">
-          <span class="empty-icon">${loading ? '<i class="spinner"></i>' : icon("alert")}</span>
-          <strong>${status.label}</strong>
-          <p>${status.detail}</p>
-          ${!loading ? '<button class="text-button" data-action="refresh">重新尝试</button>' : ""}
-        </div>`}
-
-      ${renderTokenUsage()}
-
-      <footer>
-        <div class="updated" title="${status.detail}">
-          ${icon(state === "ok" ? "check" : state === "loading" ? "clock" : "alert")}
-          <span>${footerCopy}</span>
-        </div>
-        <button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出">${icon("exit")}</button>
-      </footer>
-    </section>
-    ${settingsOpen ? `
-      <div class="settings-stack">
-      <span class="settings-connector" aria-hidden="true"></span>
-      <section class="glass-card settings-card" id="settings-card" aria-label="偏好设置">
-        <div class="shine" aria-hidden="true"></div>
-        <div class="settings-header">
-          <div><span class="settings-mark">${icon("settings")}</span><h2>偏好设置</h2></div>
-          <button class="icon-button" data-action="settings" aria-label="关闭偏好设置" title="关闭">${icon("close")}</button>
-        </div>
-        <div class="settings-panel">
-          <div class="setting-row"><span class="setting-label"><i>${icon("moon")}</i><span>界面主题</span></span><strong>跟随系统</strong></div>
-          <div class="setting-row"><span class="setting-label"><i>${icon("clock")}</i><span>自动刷新</span></span><strong>每 1 分钟</strong></div>
-          <label class="setting-row setting-toggle" for="autostart-toggle">
-            <span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>随系统登录启动</span><small id="autostart-help">登录后自动驻留托盘</small></span></span>
-            <input id="autostart-toggle" type="checkbox" data-setting="autostart" aria-describedby="autostart-help" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}>
-            <span class="switch" aria-hidden="true"><i></i></span>
-          </label>
-        </div>
-        <div class="passport-settings">
-          <label class="setting-row setting-toggle">
-            <span class="setting-copy"><span>Passport Bridge</span><small>手动开启局域网连接</small></span>
-            <input type="checkbox" data-setting="passport" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri || !passport.config.environmentFile ? "disabled" : ""}>
-            <span class="switch" aria-hidden="true"><i></i></span>
-          </label>
-          <p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>
-          <button data-action="passport-config" ${passport.running || passportBusy ? "disabled" : ""}>${passportEditing ? "收起配置" : "配置 Bridge"}</button>
-          ${passportEditing ? `<form id="passport-config" class="passport-form">
-            <label>Node 运行时路径<input name="runtime" required value="${escapePassport(passport.config.runtime)}" placeholder="Node 可执行文件的绝对路径"></label>
-            <label>Bridge 脚本路径<input name="script" required value="${escapePassport(passport.config.script)}" placeholder="server.mjs 的绝对路径"></label>
-            <label>环境配置文件<input name="environmentFile" required value="${escapePassport(passport.config.environmentFile)}" placeholder="环境变量 JSON 文件的绝对路径"></label>
-            <button type="submit" ${passportBusy ? "disabled" : ""}>保存配置</button>
-            <p class="setting-note">首次绑定仍需 USB。每次启动 Meter 后手动开启；桌面审批同步仍属实验功能。</p>
-          </form>` : ""}
-        </div>
-        ${autostartError ? `<p class="setting-note setting-error" role="status">设置失败：${autostartError}</p>` : `<p class="setting-note">${autostartLoading ? "正在读取系统启动设置…" : autostartEnabled ? "已加入系统登录项。" : "安装到固定位置后再开启。"}</p>`}
-      </section>
-      </div>` : ""}
-    <span class="bubble-tail" aria-hidden="true"></span>
-    </div>`;
+      <div class="panel-scroll${changedView ? " view-enter" : ""}">
+        ${settingsOpen ? renderSettings() : `${renderQuota()}${renderPassport()}${renderTokenUsage()}`}
+      </div>
+      <footer class="panel-footer"><div class="updated" role="status" title="${escapePassport(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : "alert")}<span>${escapePassport(footerStatusCopy())}</span></div><button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button></footer>
+    </section><span class="bubble-tail" aria-hidden="true"></span>
+  </div>`;
+  if (!changedView) {
+    const scroller = app.querySelector<HTMLElement>(".panel-scroll");
+    if (scroller) scroller.scrollTop = scrollTop;
+  }
+  if (focusId) {
+    const input = document.getElementById(focusId) as HTMLInputElement | null;
+    input?.focus({ preventScroll: true });
+    if (selection && selection[0] !== null && selection[1] !== null) input?.setSelectionRange(selection[0], selection[1]);
+  }
   observePanelSize();
   schedulePanelSync();
 }
@@ -658,7 +627,9 @@ function schedulePanelSync(): void {
     if (!shell) return;
     const bodyStyle = getComputedStyle(document.body);
     const width = Math.ceil(shell.offsetWidth + parseFloat(bodyStyle.paddingLeft) + parseFloat(bodyStyle.paddingRight));
-    const height = Math.ceil(shell.offsetHeight + parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom));
+    const scroll = shell.querySelector<HTMLElement>(".panel-scroll");
+    const hiddenContent = scroll ? Math.max(0, Math.min(scroll.scrollHeight, 600) - scroll.clientHeight) : 0;
+    const height = Math.ceil(shell.offsetHeight + hiddenContent + parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom));
     applyPanelPosition();
     const nextSize = `${width}x${height}`;
     if (nextSize === lastPanelSize) return;
@@ -1104,8 +1075,34 @@ app.addEventListener("click", async (event) => {
   const button = (event.target as Element).closest<HTMLButtonElement>("button[data-action]");
   if (!button) return;
   switch (button.dataset.action) {
-    case "passport-config":
-      passportEditing = !passportEditing;
+    case "passport-setup":
+      settingsOpen = true;
+      render();
+      break;
+    case "passport-toggle":
+      await passportCommand("passport_toggle", { enabled: !passport.running });
+      app.querySelector<HTMLButtonElement>('[data-action="passport-toggle"]')?.focus();
+      break;
+    case "passport-bind":
+      await generatePairing();
+      break;
+    case "passport-approve":
+    case "passport-reject": {
+      if (!pairingPending || (button.dataset.action === "passport-approve" && !pairingCompared)) break;
+      if (passportBusy) break;
+      passportBusy = true; ++passportRevision; render();
+      try {
+        const accepted = button.dataset.action === "passport-approve";
+        await invoke("passport_enrollment_decide", { requestId: pairingPending.requestId, accepted });
+        pairingPending = null; pairingCompared = false;
+        if (!accepted) { pairingCode = ""; pairingExpiresAt = 0; pairingError = "已拒绝绑定，请重新生成绑定码。"; }
+      }
+      catch (error) { pairingError = String(error); }
+      finally { passportBusy = false; render(); }
+      break;
+    }
+    case "passport-hide-code":
+      pairingCode = "";
       render();
       break;
     case "refresh":
@@ -1120,7 +1117,7 @@ app.addEventListener("click", async (event) => {
       settingsOpen = !settingsOpen;
       render();
       app.querySelector<HTMLButtonElement>('[data-action="settings"]')?.focus();
-      if (isTauri && settingsOpen) void invoke("open_settings").catch(() => undefined);
+
       break;
     case "exit":
       if (isTauri) await invoke("quit_app");
@@ -1129,15 +1126,11 @@ app.addEventListener("click", async (event) => {
   }
 });
 
-app.addEventListener("submit", (event) => {
-  if (!(event.target instanceof HTMLFormElement) || event.target.id !== "passport-config") return;
-  event.preventDefault();
-  const data = new FormData(event.target);
-  void passportCommand("passport_configure", { config: { runtime: String(data.get("runtime")).trim(), script: String(data.get("script")).trim(), environmentFile: String(data.get("environmentFile")).trim() } });
-});
 app.addEventListener("change", (event) => {
   const toggle = (event.target as Element).closest<HTMLInputElement>('input[data-setting="passport"]');
-  if (toggle) void passportCommand("passport_toggle", { enabled: toggle.checked });
+  if (toggle) {
+    void passportCommand("passport_toggle", { enabled: toggle.checked });
+  }
   const input = (event.target as Element).closest<HTMLInputElement>('input[data-setting="autostart"]');
   if (input) void setAutostart(input.checked);
 });
@@ -1147,7 +1140,7 @@ render();
 if (isTauri) {
   void passportCommand("passport_status");
   window.setInterval(() => {
-    if (settingsOpen && !passportEditing && !passportBusy) void passportCommand("passport_status");
+    if (document.visibilityState === "visible" && !passportBusy) void passportCommand("passport_status");
   }, 3000);
   document.addEventListener("contextmenu", (event) => event.preventDefault());
   document.addEventListener("keydown", (event) => {
@@ -1187,3 +1180,28 @@ window.setInterval(() => void refreshTokenUsage(), 15_000);
 themeQuery.addEventListener("change", () => {
   void updateTrayIcon(snapshot);
 });
+
+async function generatePairing(): Promise<void> {
+  if (passportBusy || !isTauri) return;
+  passportBusy = true; ++passportRevision; pairingBusy = true; pairingError = ""; pairingCode = ""; pairingPending = null; pairingCompared = false; render();
+  try {
+    const value = await invoke<{ code: string; expiresAt: number }>("passport_enrollment");
+    pairingCode = value.code; pairingExpiresAt = value.expiresAt;
+    passport = await invoke<PassportStatus>("passport_status");
+    setTimeout(() => { if (Date.now() >= pairingExpiresAt && pairingCode) { pairingCode = ""; pairingError = "绑定码已过期，请重新点击绑定设备。"; render(); } }, Math.max(0, pairingExpiresAt - Date.now()));
+  } catch (error) { pairingError = String(error); }
+  finally { passportBusy = false; pairingBusy = false; render(); }
+}
+
+app.addEventListener("change", event => { if ((event.target as HTMLInputElement).id === "pairing-compared") { pairingCompared = (event.target as HTMLInputElement).checked; render(); } });
+let enrollmentPolling = false;
+window.setInterval(async () => {
+    if (!isTauri || enrollmentPolling || passportBusy) return;
+    enrollmentPolling = true;
+    const revision = passportRevision;
+    try {
+        const pending = await invoke<PendingEnrollment | null>("passport_enrollment_status");
+        if (revision === passportRevision && pending?.requestId !== pairingPending?.requestId) { pairingPending = pending; pairingCompared = false; render(); }
+    } catch { /* Keep connection polling independent from binding UI. */ }
+    finally { enrollmentPolling = false; }
+}, 1500);

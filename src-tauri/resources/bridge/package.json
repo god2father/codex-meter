@@ -1,0 +1,19 @@
+{
+  "name": "codex-passport-bridge",
+  "version": "0.1.0",
+  "description": "Local approval companion for FoloToy AI Passport",
+  "scripts": {
+    "test": "node --test",
+    "demo": "node server.mjs --demo",
+    "start": "node server.mjs"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "lv_font_conv": "1.5.3"
+  },
+  "private": true,
+  "type": "module"
+}

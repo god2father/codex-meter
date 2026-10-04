@@ -1,11 +1,19 @@
 mod codex;
+#[cfg(target_os = "macos")]
+mod macos_tray;
 mod passport;
-use passport::{passport_configure, passport_status, passport_toggle, PassportState};
+use passport::{
+    passport_configure, passport_enrollment, passport_enrollment_decide,
+    passport_enrollment_status, passport_pairing, passport_status, passport_toggle, PassportState,
+};
 mod token_usage;
 
 use codex::{CodexService, UsageSnapshot};
 use serde::Serialize;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -23,6 +31,44 @@ struct TrayAnchor {
 }
 
 struct TrayAnchorState(Mutex<Option<TrayAnchor>>);
+#[derive(Default)]
+struct PanelFocusState(AtomicBool);
+#[derive(Default)]
+struct GlassState(AtomicBool);
+#[tauri::command]
+fn native_glass(state: State<'_, GlassState>) -> bool {
+    state.0.load(Ordering::Relaxed)
+}
+
+fn accepts_panel_click(button: MouseButton, state: MouseButtonState, macos: bool) -> bool {
+    button == MouseButton::Left
+        && state
+            == if macos {
+                MouseButtonState::Down
+            } else {
+                MouseButtonState::Up
+            }
+}
+
+fn panel_trace(message: &str) {
+    if let Some(path) = std::env::var_os("CODEX_METER_DIAGNOSTICS_PATH") {
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{} {message}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis()
+            );
+        }
+    }
+}
 
 fn preview_mode() -> bool {
     cfg!(debug_assertions) && std::env::var_os("CODEX_METER_PREVIEW").is_some()
@@ -170,11 +216,41 @@ fn resize_panel(
 }
 
 fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    panel_trace("show requested");
     let window = app
         .get_webview_window("main")
         .ok_or("Main window is unavailable")?;
+    let anchor = app
+        .state::<TrayAnchorState>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .or_else(|| {
+            let rect = app.tray_by_id("usage")?.rect().ok()??;
+            let scale = window.scale_factor().ok()?;
+            let position = rect.position.to_physical::<f64>(scale);
+            Some(TrayAnchor {
+                click: position,
+                rect,
+            })
+        });
+    if let Some(anchor) = anchor {
+        position_near_tray(app, &window, &anchor);
+    }
+    app.state::<PanelFocusState>()
+        .0
+        .store(window.is_focused().unwrap_or(false), Ordering::Relaxed);
+    #[cfg(target_os = "macos")]
+    app.show().map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
-    window.set_focus().map_err(|error| error.to_string())
+    window.set_focus().map_err(|error| error.to_string())?;
+    panel_trace(&format!(
+        "show completed visible={:?} focused={:?}",
+        window.is_visible(),
+        window.is_focused()
+    ));
+    Ok(())
 }
 
 fn toggle_main_window(app: &tauri::AppHandle, anchor: Option<TrayAnchor>) {
@@ -185,10 +261,13 @@ fn toggle_main_window(app: &tauri::AppHandle, anchor: Option<TrayAnchor>) {
         let _ = window.hide();
     } else {
         if let Some(anchor) = anchor {
-            position_near_tray(app, &window, &anchor);
+            if let Ok(mut stored) = app.state::<TrayAnchorState>().0.lock() {
+                *stored = Some(anchor);
+            }
         }
-        let _ = window.show();
-        let _ = window.set_focus();
+        if let Err(error) = show_main_window(app) {
+            eprintln!("Panel could not open: {error}");
+        }
     }
 }
 
@@ -222,14 +301,20 @@ fn position_near_tray(app: &tauri::AppHandle, window: &tauri::WebviewWindow, tra
     );
 
     let (mut x, mut y) = match edge {
-        PanelEdge::Top => (anchor_center_x - window_size.width as i64 / 2, work_top),
+        PanelEdge::Top => (
+            anchor_center_x - window_size.width as i64 / 2,
+            anchor.y as i64 + anchor_size.height as i64 + 2,
+        ),
         PanelEdge::Bottom => (
             anchor_center_x - window_size.width as i64 / 2,
-            work_bottom - window_size.height as i64,
+            anchor.y as i64 - window_size.height as i64 - 2,
         ),
-        PanelEdge::Left => (work_left, anchor_center_y - window_size.height as i64 / 2),
+        PanelEdge::Left => (
+            anchor.x as i64 + anchor_size.width as i64 + 2,
+            anchor_center_y - window_size.height as i64 / 2,
+        ),
         PanelEdge::Right => (
-            work_right - window_size.width as i64,
+            anchor.x as i64 - window_size.width as i64 - 2,
             anchor_center_y - window_size.height as i64 / 2,
         ),
     };
@@ -595,10 +680,46 @@ pub fn run() {
         .manage(AppState(Arc::new(Mutex::new(CodexService::new()))))
         .manage(PassportState::default())
         .manage(TrayAnchorState(Mutex::new(None)))
+        .manage(PanelFocusState::default())
+        .manage(GlassState::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
             app.handle()
                 .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+
+            if let Some(window) = app.get_webview_window("main") {
+                #[cfg(target_os = "macos")]
+                {
+                    let liquid = window_vibrancy::apply_liquid_glass(
+                        &window,
+                        window_vibrancy::LiquidGlassOptions::new(
+                            window_vibrancy::NSGlassEffectViewStyle::Clear,
+                        )
+                        .radius(30.0)
+                        .interactive(true),
+                    )
+                    .is_ok();
+                    panel_trace(&format!("native clear glass={liquid}"));
+                    app.state::<GlassState>().0.store(liquid, Ordering::Relaxed);
+                    if !liquid {
+                        window.set_effects(
+                            tauri::window::EffectsBuilder::new()
+                                .effect(tauri::window::Effect::Popover)
+                                .state(tauri::window::EffectState::Active)
+                                .radius(30.0)
+                                .build(),
+                        )?;
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                window.set_effects(
+                    tauri::window::EffectsBuilder::new()
+                        .effect(tauri::window::Effect::Acrylic)
+                        .color(tauri::window::Color(20, 35, 42, 18))
+                        .build(),
+                )?;
+                let _ = window.set_shadow(true);
+            }
 
             let show = MenuItem::with_id(app, "show", "显示用量", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
@@ -607,7 +728,7 @@ pub fn run() {
                 MenuItem::with_id(app, "settings", "设置 / Passport", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &refresh, &settings, &quit])?;
 
-            TrayIconBuilder::with_id("usage")
+            let tray = TrayIconBuilder::with_id("usage")
                 .icon(neutral_icon())
                 .tooltip("Codex Meter")
                 .menu(&menu)
@@ -635,11 +756,12 @@ pub fn run() {
                     if let TrayIconEvent::Click {
                         position,
                         rect,
-                        button_state: MouseButtonState::Up,
+                        button_state,
                         button,
                         ..
                     } = event
                     {
+                        panel_trace(&format!("tray click {button:?} {button_state:?}"));
                         let anchor = TrayAnchor {
                             click: position,
                             rect,
@@ -649,12 +771,16 @@ pub fn run() {
                         {
                             *stored = Some(anchor.clone());
                         }
-                        if button == MouseButton::Left {
-                            toggle_main_window(tray.app_handle(), Some(anchor));
+                        if accepts_panel_click(button, button_state, cfg!(target_os = "macos")) {
+                            if let Err(error) = show_main_window(tray.app_handle()) {
+                                eprintln!("Tray panel could not open: {error}");
+                            }
                         }
                     }
                 })
                 .build(app)?;
+            #[cfg(target_os = "macos")]
+            macos_tray::install(&tray)?;
 
             if preview_mode() {
                 if let Some(window) = app.get_webview_window("main") {
@@ -667,10 +793,15 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
             passport_status,
+            passport_pairing,
+            passport_enrollment,
+            passport_enrollment_status,
+            passport_enrollment_decide,
             passport_configure,
             passport_toggle,
             read_token_usage,
             runtime_platform,
+            native_glass,
             update_tray_icon,
             resize_panel,
             hide_panel,
@@ -681,6 +812,10 @@ pub fn run() {
         .expect("failed to build Codex Meter");
 
     app.run(|app, event| {
+        #[cfg(target_os = "macos")]
+        if matches!(event, RunEvent::Reopen { .. }) {
+            let _ = show_main_window(app);
+        }
         if matches!(event, RunEvent::Exit) {
             if let Ok(mut bridge) = app.state::<PassportState>().0.lock() {
                 let _ = bridge.stop();
@@ -695,9 +830,25 @@ pub fn run() {
                             let _ = window.hide();
                         }
                     }
+                    WindowEvent::Focused(true) => {
+                        panel_trace("focused true");
+                        app.state::<PanelFocusState>()
+                            .0
+                            .store(true, Ordering::Relaxed);
+                    }
                     WindowEvent::Focused(false) => {
+                        panel_trace("focused false");
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.hide();
+                            // Activation can queue an old blur before the panel becomes key.
+                            if app.state::<PanelFocusState>().0.load(Ordering::Relaxed)
+                                && !window.is_focused().unwrap_or(false)
+                            {
+                                panel_trace("blur hides panel");
+                                let _ = window.hide();
+                                app.state::<PanelFocusState>()
+                                    .0
+                                    .store(false, Ordering::Relaxed);
+                            }
                         }
                     }
                     _ => {}
@@ -709,7 +860,33 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{nearest_edge, PanelEdge};
+    use super::{accepts_panel_click, nearest_edge, MouseButton, MouseButtonState, PanelEdge};
+    #[test]
+    fn tray_panel_opens_once_per_left_click() {
+        for macos in [true, false] {
+            let states = [MouseButtonState::Down, MouseButtonState::Up];
+            assert_eq!(
+                states
+                    .iter()
+                    .filter(|s| accepts_panel_click(MouseButton::Left, **s, macos))
+                    .count(),
+                1
+            );
+            for state in states {
+                assert!(!accepts_panel_click(MouseButton::Right, state, macos));
+            }
+        }
+        assert!(accepts_panel_click(
+            MouseButton::Left,
+            MouseButtonState::Down,
+            true
+        ));
+        assert!(accepts_panel_click(
+            MouseButton::Left,
+            MouseButtonState::Up,
+            false
+        ));
+    }
 
     #[test]
     fn detects_each_taskbar_edge() {

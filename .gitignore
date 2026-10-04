@@ -5,3 +5,11 @@ src-tauri/target-*/
 src-tauri/gen/schemas/
 *.log
 .DS_Store
+
+# Legacy generated runtime binaries; Node is discovered externally.
+src-tauri/resources/runtime/node
+src-tauri/resources/runtime/node.exe
+
+# Generated dependency integrity index.
+src-tauri/resources/manifest.json
+.playwright-cli/

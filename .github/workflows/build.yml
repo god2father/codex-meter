@@ -41,7 +41,9 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: 安装前端依赖
-        run: npm ci
+        run: |
+          npm ci
+          npm run bridge:prepare
 
       - name: 检查代码
         run: |
@@ -100,7 +102,9 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: 安装前端依赖
-        run: npm ci
+        run: |
+          npm ci
+          npm run bridge:prepare
 
       - name: 检查代码
         run: |

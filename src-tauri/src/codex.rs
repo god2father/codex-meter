@@ -162,7 +162,7 @@ impl RpcClient {
 
         let response = self.request("account/rateLimits/read", json!({}))?;
         let reset_credits_available = available_reset_credits(&response);
-        let limits = response.get("rateLimits").unwrap_or(&response);
+        let limits = codex_limits(&response).unwrap_or(&Value::Null);
         let plan_type = preferred_plan_type(limits, account_plan_type);
         let primary = limits.get("primary").and_then(UsageWindow::from_value);
         let secondary = limits.get("secondary").and_then(UsageWindow::from_value);
@@ -242,7 +242,7 @@ impl Drop for RpcClient {
     }
 }
 
-fn codex_candidates() -> Vec<String> {
+pub(crate) fn codex_candidates() -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(path) = env::var("CODEX_METER_CODEX_PATH") {
         if !path.trim().is_empty() {
@@ -251,6 +251,8 @@ fn codex_candidates() -> Vec<String> {
     }
     #[cfg(target_os = "macos")]
     candidates.extend([
+        "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"
+            .into(),
         "/Applications/ChatGPT.app/Contents/Resources/codex".into(),
         "/Applications/Codex.app/Contents/Resources/codex".into(),
     ]);
@@ -259,6 +261,7 @@ fn codex_candidates() -> Vec<String> {
         let home = home.trim_end_matches('/');
         if !home.is_empty() {
             candidates.extend([
+                format!("{home}/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
                 format!("{home}/Applications/ChatGPT.app/Contents/Resources/codex"),
                 format!("{home}/Applications/Codex.app/Contents/Resources/codex"),
             ]);
@@ -397,6 +400,20 @@ fn window_label(minutes: i64) -> String {
     }
 }
 
+fn codex_limits(response: &Value) -> Option<&Value> {
+    let candidate = match response.get("rateLimitsByLimitId") {
+        Some(map) if !map.is_null() => map.get("codex"),
+        _ => response.get("rateLimits"),
+    }?;
+    if candidate
+        .get("limitId")
+        .is_some_and(|id| !id.is_null() && id.as_str() != Some("codex"))
+    {
+        return None;
+    }
+    candidate.as_object().map(|_| candidate)
+}
+
 fn preferred_plan_type(limits: &Value, account_plan_type: Option<String>) -> Option<String> {
     limits
         .get("planType")
@@ -423,6 +440,25 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_codex_bucket_and_never_falls_back_to_another_bucket() {
+        let mapped = json!({ "rateLimitsByLimitId": { "codex": { "primary": { "usedPercent": 25 } } }, "rateLimits": { "limitId": "other" } });
+        assert_eq!(codex_limits(&mapped).unwrap()["primary"]["usedPercent"], 25);
+        assert!(codex_limits(
+            &json!({ "rateLimitsByLimitId": { "other": {} }, "rateLimits": { "limitId": "codex" } })
+        )
+        .is_none());
+        assert!(codex_limits(&json!({ "rateLimits": { "limitId": "other" } })).is_none());
+        assert!(codex_limits(
+            &json!({ "rateLimitsByLimitId": null, "rateLimits": { "primary": {} } })
+        )
+        .is_some());
+        assert!(codex_limits(
+            &json!({ "rateLimitsByLimitId": { "codex": { "limitId": "other" } } })
+        )
+        .is_none());
+    }
 
     #[test]
     fn maps_backend_window_and_clamps_percent() {

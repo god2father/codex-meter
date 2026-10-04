@@ -1,3 +1,5 @@
+#[path = "passport_managed.rs"]
+mod managed;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -23,11 +25,13 @@ pub struct Status {
     config: Config,
     running: bool,
     connected: bool,
+    failed: bool,
     message: String,
 }
 #[derive(Default)]
 pub struct Bridge {
     config: Config,
+    failure: Option<String>,
     child: Option<Child>,
     probe: Option<(reqwest::blocking::Client, u16)>,
 }
@@ -71,10 +75,14 @@ impl Bridge {
         }
         self.child = None;
         self.probe = None;
+        self.failure = None;
         Ok(())
     }
     fn status(&mut self) -> Result<Status, String> {
-        let mut message = "已关闭；开启后允许局域网设备连接".to_owned();
+        let mut message = self
+            .failure
+            .clone()
+            .unwrap_or_else(|| "已关闭；开启后允许局域网设备连接".to_owned());
         if let Some(child) = self.child.as_mut() {
             if child
                 .try_wait()
@@ -84,6 +92,7 @@ impl Bridge {
                 self.child = None;
                 self.probe = None;
                 message = "Bridge 已退出，请检查运行时、配置与端口".into();
+                self.failure = Some(message.clone());
             }
         }
         let running = self.child.is_some();
@@ -117,6 +126,7 @@ impl Bridge {
             config: self.config.clone(),
             running,
             connected,
+            failed: self.failure.is_some(),
             message,
         })
     }
@@ -173,7 +183,9 @@ fn environment(path: &str) -> Result<BTreeMap<String, String>, String> {
 fn read_status(app: tauri::AppHandle, state: Arc<Mutex<Bridge>>) -> Result<Status, String> {
     let mut bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
     if bridge.child.is_none() && bridge.config.environment_file.is_empty() {
-        if let Ok(bytes) = fs::read(config_path(&app)?) {
+        if let Some(config) = managed::existing(&app)? {
+            bridge.config = config;
+        } else if let Ok(bytes) = fs::read(config_path(&app)?) {
             bridge.config = serde_json::from_slice(&bytes).map_err(|_| "Meter Bridge 配置损坏")?;
         }
     }
@@ -202,6 +214,7 @@ fn configure(
     )
     .map_err(|_| "无法保存配置")?;
     bridge.config = config;
+    bridge.failure = None;
     bridge.status()
 }
 fn toggle(state: Arc<Mutex<Bridge>>, enabled: bool) -> Result<Status, String> {
@@ -278,6 +291,7 @@ fn toggle(state: Arc<Mutex<Bridge>>, enabled: bool) -> Result<Status, String> {
         command.process_group(0);
     }
     drop(reservation);
+    bridge.failure = None;
     bridge.child = Some(
         command
             .spawn()
@@ -309,13 +323,37 @@ pub async fn passport_configure(
 }
 #[tauri::command]
 pub async fn passport_toggle(
+    app: tauri::AppHandle,
     state: State<'_, PassportState>,
     enabled: bool,
 ) -> Result<Status, String> {
     let state = Arc::clone(&state.0);
-    tauri::async_runtime::spawn_blocking(move || toggle(state, enabled))
-        .await
-        .map_err(|_| "Bridge 启停任务失败")?
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = (|| {
+            if enabled {
+                let managed_config = {
+                    let bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+                    bridge.child.is_none()
+                        && (bridge.config.environment_file.is_empty()
+                            || environment(&bridge.config.environment_file)?
+                                .contains_key("PASSPORT_METER_ADDRESSES"))
+                };
+                if managed_config {
+                    let (config, _) = managed::prepare(&app)?;
+                    state.lock().map_err(|_| "Bridge 管理器不可用")?.config = config;
+                }
+            }
+            toggle(state.clone(), enabled)
+        })();
+        if let Err(error) = &result {
+            if let Ok(mut bridge) = state.lock() {
+                bridge.failure = Some(error.clone());
+            }
+        }
+        result
+    })
+    .await
+    .map_err(|_| "Bridge 启停任务失败")?
 }
 #[cfg(test)]
 mod tests {
@@ -345,6 +383,7 @@ mod tests {
         let mut b = Bridge {
             child: Some(child),
             config: Config::default(),
+            failure: None,
             probe: None,
         };
         assert!(b.status().unwrap().running);
@@ -354,6 +393,13 @@ mod tests {
         b.child.as_mut().unwrap().wait().unwrap();
         assert!(!b.status().unwrap().running);
         assert!(b.probe.is_none());
+        assert!(b.status().unwrap().failed);
+        assert!(
+            b.status().unwrap().failed,
+            "Polling must retain a startup failure"
+        );
+        b.stop().unwrap();
+        assert!(!b.status().unwrap().failed);
     }
     #[test]
     fn occupied_port_remains_owned_by_existing_listener() {
@@ -419,9 +465,28 @@ mod tests {
                 script: script.to_str().unwrap().into(),
                 environment_file: env_file.to_str().unwrap().into(),
             },
+            failure: None,
             child: None,
             probe: None,
         }));
+        let config = state.lock().unwrap().config.clone();
+        let binding = pairing(&config, "192.168.1.10").unwrap();
+        let exported = serde_json::to_value(&binding).unwrap();
+        assert_eq!(
+            binding.bridge_uri,
+            format!("wss://192.168.1.10:{port}/passport")
+        );
+        assert_eq!(binding.token, "b".repeat(32));
+        assert_eq!(exported.as_object().unwrap().len(), 4);
+        for invalid in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "8.8.8.8",
+            "192.168.4.1",
+            "192.168.1.10/path",
+        ] {
+            assert!(pairing(&config, invalid).is_err());
+        }
         assert!(toggle(state.clone(), true).is_err());
         assert!(existing.local_addr().is_ok());
         drop(existing);
@@ -451,4 +516,147 @@ mod tests {
         fs::remove_file(p).unwrap();
         assert!(!e.contains("private-invalid-value"));
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pairing {
+    bridge_uri: String,
+    token: String,
+    ca_pem: String,
+    ntp_server: String,
+}
+
+fn pairing(config: &Config, address: &str) -> Result<Pairing, String> {
+    let host: Ipv4Addr = address
+        .parse()
+        .map_err(|_| "请输入电脑的局域网 IPv4 地址")?;
+    if !host.is_private() || host.is_loopback() || host == Ipv4Addr::new(192, 168, 4, 1) {
+        return Err("请使用电脑所在 Wi-Fi 的局域网地址".into());
+    }
+    let env = environment(&config.environment_file)?;
+    let port: u16 = env
+        .get("PASSPORT_PORT")
+        .map(String::as_str)
+        .unwrap_or("8765")
+        .parse()
+        .map_err(|_| "无效 Bridge 端口")?;
+    if port == 0 {
+        return Err("无效 Bridge 端口".into());
+    }
+    let bytes = fs::read(&env["PASSPORT_TLS_CERT"]).map_err(|_| "无法读取电脑绑定证书")?;
+    if bytes.len() > 3072 {
+        return Err("绑定证书超过设备容量".into());
+    }
+    reqwest::Certificate::from_pem(&bytes).map_err(|_| "无效电脑绑定证书")?;
+    let ca_pem = String::from_utf8(bytes).map_err(|_| "证书必须为 PEM 文本")?;
+    Ok(Pairing {
+        bridge_uri: format!("wss://{host}:{port}/passport"),
+        token: env["PASSPORT_DEVICE_TOKEN"].clone(),
+        ca_pem,
+        ntp_server: "pool.ntp.org".into(),
+    })
+}
+
+#[tauri::command]
+pub async fn passport_pairing(
+    app: tauri::AppHandle,
+    state: State<'_, PassportState>,
+    address: String,
+) -> Result<Pairing, String> {
+    let state = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+        let mut address = address;
+        let managed_config = bridge.config.environment_file.is_empty()
+            || environment(&bridge.config.environment_file)?
+                .contains_key("PASSPORT_METER_ADDRESSES");
+        if managed_config {
+            let (config, detected) = if bridge.child.is_some() {
+                managed::prepare(&app)?
+            } else {
+                managed::prepare_binding(&app)?
+            };
+            bridge.config = config;
+            address = detected;
+        } else if address.is_empty() {
+            if bridge.child.is_some() {
+                return Err("请先关闭连接，再绑定设备以启用内置服务".into());
+            }
+            let (config, detected) = managed::prepare_binding(&app)?;
+            bridge.config = config;
+            address = detected;
+        }
+        pairing(&bridge.config, &address)
+    })
+    .await
+    .map_err(|_| "无法生成绑定信息")?
+}
+
+#[tauri::command]
+pub async fn passport_enrollment(
+    app: tauri::AppHandle,
+    state: State<'_, PassportState>,
+) -> Result<managed::Enrollment, String> {
+    let state = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = {
+            let mut bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+            let managed_config = bridge.config.environment_file.is_empty()
+                || environment(&bridge.config.environment_file)?
+                    .contains_key("PASSPORT_METER_ADDRESSES");
+            if !managed_config && bridge.child.is_some() {
+                return Err("请先关闭连接，再绑定设备以启用内置服务".into());
+            }
+            if bridge.child.is_some()
+                && managed_config
+                && !environment(&bridge.config.environment_file)?
+                    .contains_key("PASSPORT_ENROLLMENT_FILE")
+            {
+                bridge.stop()?;
+            }
+            let (config, address) = if bridge.child.is_some() {
+                managed::prepare(&app)?
+            } else {
+                managed::prepare_binding(&app)?
+            };
+            let result = managed::enrollment(&config, &address)?;
+            bridge.config = config;
+            result
+        };
+        let status = toggle(state.clone(), true)?;
+        if status.failed {
+            return Err(status.message);
+        }
+        Ok(result)
+    })
+    .await
+    .map_err(|_| "无法准备设备绑定")?
+}
+
+#[tauri::command]
+pub async fn passport_enrollment_status(
+    state: State<'_, PassportState>,
+) -> Result<Option<managed::PendingEnrollment>, String> {
+    let state = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+        managed::enrollment_status(&bridge.config)
+    })
+    .await
+    .map_err(|_| "无法读取绑定请求")?
+}
+#[tauri::command]
+pub async fn passport_enrollment_decide(
+    state: State<'_, PassportState>,
+    request_id: String,
+    accepted: bool,
+) -> Result<(), String> {
+    let state = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+        managed::enrollment_decide(&bridge.config, &request_id, accepted)
+    })
+    .await
+    .map_err(|_| "无法确认设备绑定")?
 }

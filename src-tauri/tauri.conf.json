@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Codex Meter",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "identifier": "com.codexmeter.meter",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npm run bridge:prepare && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run bridge:prepare && npm run build",
     "frontendDist": "../dist",
     "removeUnusedCommands": true
   },
@@ -46,6 +46,10 @@
     "shortDescription": "Codex usage in your system tray",
     "macOS": {
       "signingIdentity": "-"
+    },
+    "resources": {
+      "resources/bridge/": "resources/bridge/",
+      "resources/manifest.json": "resources/manifest.json"
     }
   }
 }

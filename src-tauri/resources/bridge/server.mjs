@@ -9,6 +9,8 @@ import { desktopControl, readDesktopChats } from './desktop-control.mjs';
 import { randomUUID } from 'node:crypto';
 import { AccountQuota } from './quota.mjs';
 import { encodeDeviceMessage } from './device-message.mjs';
+import { DeviceChats, loadChatTarget, saveChatTarget } from './device-chats.mjs';
+import { ChatContent, chatContent, chatMessages } from './chat-content.mjs';
 
 const demo = process.argv.includes('--demo');
 const simulator = process.argv.includes('--simulator');
@@ -22,6 +24,23 @@ let device;
 let app;
 let session;
 let quota;
+let deviceChats;
+let selectedChatTitle = null;
+let selectingChat = false;
+let contentReader, contentText = '', contentReadAt = 0, contentVersion = 0;
+let contentLive = false;
+let contentMessages = [];
+async function refreshContent() {
+  if (!desktop || !contentReader || contentReader.busy || contentLive || device?.readyState !== 1 || !app?.threadId) return;
+  const threadId = app.threadId, generation = app.generation;
+  const version = contentVersion, deviceVersion = deviceGeneration;
+  contentReadAt = Date.now();
+  const content = await contentReader.read(threadId);
+  if (content !== null && !contentLive && generation === app.generation && threadId === app.threadId && version === contentVersion &&
+      deviceVersion === deviceGeneration && device?.readyState === 1 && content.text !== contentText) {
+    contentText = content.text; contentMessages = content.messages; publish();
+  }
+}
 let demoId = 0;
 let handleDesktopControl;
 let assistantQuestion;
@@ -93,6 +112,8 @@ function publish() {
   if (device?.readyState === 1) device.send(encodeDeviceMessage({
     ...(queue.current() ?? { ...(session?.snapshot() ?? { type: 'status', state: 'idle' }), clearApproval: true }),
     threadId: session?.threadId ?? null, threadTitle: session?.threadTitle ?? '',
+    synced: desktop ? !app?.closed && app?.state !== undefined : true,
+    ...(queue.current() ? {} : { content: contentText, messages: contentMessages }),
     quota: limits ? { ...limits, lines: [lineFor(limits.primary), lineFor(limits.secondary)] } : null
   }) ?? JSON.stringify({ type: 'error', message: '请求过长，请在电脑处理' }));
 }
@@ -156,18 +177,43 @@ ws.on('connection', client => {
   client.alive = true;
   client.on('pong', () => { client.alive = true; });
   if (demo) demoRequest(); else { if (desktop) replayDesktop(); publish(); }
-  client.on('message', raw => {
+  void refreshContent();
+  client.on('message', async raw => {
+    let chatRequestId;
     try {
       const m = JSON.parse(raw.toString());
       if (m.type === 'ready') { if (desktop) replayDesktop(); publish(); return; }
+      if (m.type === 'chats' && desktop && deviceChats) {
+        if (!Number.isInteger(m.requestId) || m.requestId < 0 || m.requestId > 0xffffffff) throw new Error('Invalid chat request');
+        chatRequestId = m.requestId;
+        if (selectingChat || queue.current()) throw new Error('Device busy');
+        selectingChat = true;
+        const generation = deviceGeneration;
+        try {
+          const page = await deviceChats.list(m.page);
+          if (device !== client || generation !== deviceGeneration) return;
+          if (queue.current() || assistantQuestion?.state === 'pending') { deviceChats.invalidate(); publish(); return; }
+          client.send(JSON.stringify({ ...page, requestId: chatRequestId }));
+        } finally { selectingChat = false; }
+        return;
+      }
+      if (m.type === 'selectChat' && desktop && deviceChats) {
+        if (selectingChat || queue.current() || app.closed) throw new Error('Device busy');
+        const chat = deviceChats.target(m.revision, m.threadId);
+        saveChatTarget(process.env.PASSPORT_SELECTED_CHAT_FILE, chat);
+        selectedChatTitle = chat.title;
+        app.select(chat.id); selectedChatTitle = null;
+        session.threadTitle = chat.title;
+        publish(); return;
+      }
       if (m.type === 'answer') queue.answer(m);
       else if (m.type === 'decision') queue.decide(m);
       else throw new Error('Unsupported message');
       publish();
-    } catch { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求' })); publish(); }
+    } catch { if (device === client && client.readyState === 1) { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求', ...(chatRequestId === undefined ? {} : { requestId: chatRequestId }) })); publish(); } }
   });
   client.on('error', () => client.terminate());
-  client.on('close', () => { if (device === client) { device = undefined; if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
+  client.on('close', () => { if (device === client) { device = undefined; deviceChats?.invalidate(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
 });
 let stopping = false;
 let reconnectTimer;
@@ -197,21 +243,30 @@ function replayDesktop() {
   }
 }
 if (desktop) {
-  app = new DesktopIpc(process.env.PASSPORT_DESKTOP_THREAD, { socketPath: process.env.CODEX_DESKTOP_IPC_PATH });
+  deviceChats = new DeviceChats(() => new AppServer(process.env.PASSPORT_QUOTA_CLI || process.env.CODEX_BIN || 'codex'));
+  contentReader = new ChatContent(() => new AppServer(process.env.PASSPORT_QUOTA_CLI || process.env.CODEX_BIN || 'codex'));
+  const savedChat = loadChatTarget(process.env.PASSPORT_SELECTED_CHAT_FILE);
+  app = new DesktopIpc(savedChat?.id ?? process.env.PASSPORT_DESKTOP_THREAD, { socketPath: process.env.CODEX_DESKTOP_IPC_PATH });
   const chats = readDesktopChats(process.env.PASSPORT_DESKTOP_CHATS);
   const titleFor = id => Array.from(chats.find(chat => chat.id === id)?.title ?? '').slice(0, 64).join('').replace(/[\p{Cc}\u2028\u2029]/gu, ' ');
   handleDesktopControl = desktopControl({ config, app, chats,
     askQuestion: askAssistantQuestion, getQuestion: questionState, getQuota: () => quota?.snapshot() ?? null });
   session = new PassportSession(app, publish);
   session.threadId = app.threadId;
-  session.threadTitle = titleFor(app.threadId);
+  session.threadTitle = savedChat?.title ?? titleFor(app.threadId);
   app.on('selected', threadId => {
+    contentText = ''; contentMessages = []; contentReadAt = 0; contentVersion++; contentLive = false;
     queue.requests.clear(); session.threadId = threadId; session.turnId = null;
-    session.threadTitle = titleFor(threadId);
+    session.threadTitle = selectedChatTitle ?? titleFor(threadId);
+    selectedChatTitle = null;
     session.cwd = ''; session.state = 'idle'; publish();
+    void refreshContent();
   });
   app.on('resolved', id => { queue.invalidate(id); publish(); });
   app.on('state', state => {
+    const content = chatContent(state);
+    contentLive = !!content;
+    if (content) { contentText = content; contentMessages = chatMessages(state); contentVersion++; }
     session.cwd = state.cwd ?? '';
     const turns = state.turns ?? [];
     const turn = turns.at(-1);
@@ -270,6 +325,7 @@ const heartbeat = setInterval(() => {
 }, config.heartbeatMs);
 heartbeat.unref();
 const expiry = setInterval(() => {
+  if (desktop && Date.now() - contentReadAt >= 10000) void refreshContent();
   if (desktop) {
     let expired = false;
     for (const [id, entry] of queue.requests) if (Date.now() >= entry.expires) { queue.invalidate(id); expired = true; }
@@ -277,5 +333,5 @@ const expiry = setInterval(() => {
   } else if (queue.expire()) publish();
 }, 1000);
 expiry.unref();
-function shutdown() { enrollment?.close(); stopping = true; quota?.stop(); clearTimeout(reconnectTimer); clearInterval(heartbeat); clearInterval(expiry); if (desktop) queue.requests.clear(); else queue.cancelAll(); device?.close(); ws.close(); server.close(); app?.close(); }
+function shutdown() { contentReader?.close(); deviceChats?.close(); enrollment?.close(); stopping = true; quota?.stop(); clearTimeout(reconnectTimer); clearInterval(heartbeat); clearInterval(expiry); if (desktop) queue.requests.clear(); else queue.cancelAll(); device?.close(); ws.close(); server.close(); app?.close(); }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

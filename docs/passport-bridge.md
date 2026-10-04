@@ -15,3 +15,21 @@ Use Node 22 or newer and run `npm run bridge:prepare` to populate locked product
 Validation includes frontend build, Rust provisioning/credential/permissions tests, repeat provisioning, four-digit leading-zero handling, code expiry, automatic authentication, private storage and stale-session rejection, and the actual bundled Bridge responding over trusted HTTPS with isolated Codex IPC. Bridge protocol tests run against the pinned upstream source. Phone-first pairing still requires on-device acceptance.
 
 Development and production Tauri entry points prepare locked Bridge dependencies and validate the resource index automatically. CI also prepares resources before Rust tests. Node remains external. Exchanges expire after 30 seconds; a still-valid code can start a new exchange when attempts remain. A single physical save confirmation finishes pairing.
+
+## Selecting a chat on Passport
+
+Updated Passport firmware opens a four-item local chat picker from idle OK.
+The authenticated device chooses its own target; the desktop's visible chat does
+not change that target. Bridge lists non-archived metadata through read-only
+`thread/list`, validates page revisions, refuses switching during approvals,
+and waits for the selected thread's IPC snapshot. The managed service stores
+only its selected ID/title in private `selected-chat.json`, preserving pairing.
+An unloaded desktop chat may remain waiting until opened.
+
+## Message bubbles and synchronization
+
+The matched firmware renders the latest user and assistant text in distinct right-purple and left-mint bubbles, in chronological order. The Bridge sends role-tagged `messages` plus legacy `content`; oversized frames discard legacy content before role-tagged messages. Each body is bounded to 450 UTF-8 bytes. Tools, reasoning and empty text are excluded. Firmware can reconstruct its scrolling content from messages-only frames.
+
+When IPC snapshots omit history, a separate read-only app-server calls `thread/read` with `includeTurns: true`, at most every ten seconds while connected and missing live text. It does not resume threads or start turns. Reads load history on the computer before extracting the two device messages, so desktop cost grows with history. Thread, connection and live-content generation checks reject stale responses. Read errors preserve existing content. Pending approvals/questions omit message bodies and take priority on the device.
+
+Both Meter and firmware must be updated, and the running Meter process restarted after replacing resources. Same-chat refreshes preserve scroll; target changes reset it. The top status bar contains quota and battery; all device icons are original integer 7-by-7 pixel sprites.

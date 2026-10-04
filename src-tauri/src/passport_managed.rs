@@ -185,7 +185,13 @@ fn prepare_in(resource: &Path, root: &Path, renew: bool) -> Result<(Config, Stri
     let env_path = root.join("environment.json");
     if env_path.is_file() {
         let mut env = environment(env_path.to_str().ok_or("无效配置路径")?)?;
-        if !env.contains_key("PASSPORT_ENROLLMENT_FILE") {
+        if !env.contains_key("PASSPORT_ENROLLMENT_FILE")
+            || !env.contains_key("PASSPORT_SELECTED_CHAT_FILE")
+        {
+            env.insert(
+                "PASSPORT_SELECTED_CHAT_FILE".into(),
+                root.join("selected-chat.json").to_string_lossy().into(),
+            );
             env.insert(
                 "PASSPORT_ENROLLMENT_FILE".into(),
                 root.join("active-enrollment.json").to_string_lossy().into(),
@@ -226,6 +232,10 @@ fn prepare_in(resource: &Path, root: &Path, renew: bool) -> Result<(Config, Stri
     private_write(&cert_path, cert.pem().as_bytes())?;
     private_write(&key_path, signing_key.serialize_pem().as_bytes())?;
     let mut env = BTreeMap::from([
+        (
+            "PASSPORT_SELECTED_CHAT_FILE".to_owned(),
+            root.join("selected-chat.json").to_string_lossy().into(),
+        ),
         ("PASSPORT_TOKEN".to_owned(), token()?),
         ("PASSPORT_DEVICE_TOKEN".into(), token()?),
         (
@@ -343,6 +353,10 @@ mod tests {
         assert_eq!(first.environment_file, second.environment_file);
         assert_eq!(address, second_address);
         assert_eq!(initial, environment(&second.environment_file).unwrap());
+        assert_eq!(
+            initial["PASSPORT_SELECTED_CHAT_FILE"],
+            root.join("selected-chat.json").to_string_lossy()
+        );
         let pairing = super::super::pairing(&first, &address).unwrap();
         assert!(pairing.ca_pem.len() < 3072);
         assert_eq!(pairing.token, initial["PASSPORT_DEVICE_TOKEN"]);

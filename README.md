@@ -1,5 +1,19 @@
 # Codex Meter
 
+## Passport 聊天副屏
+
+Meter 内置 Bridge，通过配对认证的 TLS 局域网连接将 Codex 状态、额度和最近消息发送到 FoloToy AI Passport。需要电脑安装 Node 22 或更新版本，并登录 Codex。设置中选择“绑定设备”，手机进入 Passport 配网页面填写 Wi-Fi 和 Meter 的四位绑定码，设备验证后确认保存；随后开启 Passport 连接。退出 Meter 会停止 Bridge。
+
+设备按 OK 打开四条一页的聊天列表，UP/DOWN 选择及翻页，OK 切换目标，长按 OK 600 毫秒返回。目标保存在私有 `selected-chat.json`，独立于电脑当前打开的聊天；未加载的目标可能需要先在 Codex 打开。待审批或提问期间不能切换。
+
+匹配固件显示右侧紫色用户气泡、左侧薄荷色助手气泡，按最近消息顺序排列。每条最多 450 个 UTF-8 字节，不显示工具、推理、图片或 Markdown 排版。UP/DOWN 滚动，顶部状态栏显示五小时、每周剩余额度和电池。图标使用原创 7×7 像素点阵。
+
+实时 IPC 缺少历史时，Bridge 通过独立只读 `thread/read` 补读；设备在线且缺少实时正文时，每十秒最多一次，不启动或恢复对话。接口在电脑读取历史后提取两条消息，因此读取成本随历史增长。过期读取结果丢弃，失败保留已有正文。同聊天刷新保持滚动，切换聊天回到开头。
+
+如果能切换但没有正文，请同时更新固件与 Meter，退出并重新运行 Meter，检查连接开关、Codex 登录和目标聊天是否已加载。仅替换磁盘资源不会更新已有 Bridge 进程。兼容固件升级保留设备 NVS 与配对；电脑地址或证书变化时重新绑定。
+
+开发构建：`npm run tauri -- build --debug --bundles app`，入口自动准备锁定的 Bridge 依赖与资源索引。不要提交运行凭据、私钥、设备日志或构建产物。详细绑定与实现说明见 [Passport Bridge](docs/passport-bridge.md)。当前屏幕、实体按键、断网恢复和长期运行仍需设备验收。
+
 Codex Meter 是一款面向 Windows 系统托盘和 macOS 菜单栏的轻量 Codex 用量查看工具。
 
 它通过本机官方 `codex app-server` 读取当前 ChatGPT 账户的用量窗口，并使用平台适配的玻璃小猫状态图标与轻薄玻璃气泡面板展示剩余额度、重置时间和套餐类型。
@@ -68,7 +82,7 @@ initialize
 ## 隐私与安全边界
 
 - 不读取或复制 `~/.codex/auth.json`。
-- 读取 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 时只解析相关事件的类型、时间戳和 token 数字，不解析或保存提示词、回复与代码内容。
+- 用量统计读取 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 时只解析相关事件的类型、时间戳和 token 数字，不解析或保存提示词、回复与代码内容。启用 Passport 聊天副屏后，Bridge 会读取所选聊天的正文并发送到已配对设备；选择文件仅保存 ID 与标题，不保存消息正文。
 - 不保存 OpenAI access token、refresh token 或浏览器 Cookie。
 - 不直接调用未公开的 `chatgpt.com/backend-api/wham/usage`。
 - 登录和令牌刷新完全交给用户已安装的 Codex CLI/App Server。

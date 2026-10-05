@@ -191,3 +191,9 @@ src-tauri/src/       Rust 后端、托盘和窗口逻辑
 src-tauri/icons/     Windows/macOS 应用图标
 src-tauri/tauri.conf.json
 ```
+
+## 实验性 Passport 语音转写
+
+Bridge 已接入录音会话、PCM 传输、FunASR offline 适配、全文分页预览和确认提交。首次使用需要在私有 Bridge 环境配置中设置 `PASSPORT_ASR_URL`；可选 `PASSPORT_ASR_TOKEN` 仅适用于支持认证的网关。原生 FunASR 不验证该认证头，不能作为长期暴露的服务。
+
+Passport 阅读正文时长按 OK 600 毫秒进入语音页，OK 开始／停止录音，预览后再次按 OK 确认。录音最长30秒，切换聊天、审批、配对或断线会取消；结果不确定时禁止自动重试。真实设备录音、NAS性能与 Desktop 提交仍待验收，当前不是已验收发布版本。

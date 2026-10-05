@@ -183,6 +183,7 @@ fn prepare_in(resource: &Path, root: &Path, renew: bool) -> Result<(Config, Stri
             .map_err(|_| "无法保护连接配置")?;
     }
     let env_path = root.join("environment.json");
+    let mut asr_settings = BTreeMap::new();
     if env_path.is_file() {
         let mut env = environment(env_path.to_str().ok_or("无效配置路径")?)?;
         if !env.contains_key("PASSPORT_ENROLLMENT_FILE")
@@ -213,6 +214,11 @@ fn prepare_in(resource: &Path, root: &Path, renew: bool) -> Result<(Config, Stri
                 },
                 address,
             ));
+        }
+        for name in ["PASSPORT_ASR_URL", "PASSPORT_ASR_TOKEN"] {
+            if let Some(value) = env.get(name) {
+                asr_settings.insert(name.to_owned(), value.clone());
+            }
         }
         // Preserve the device's existing trust identity rather than silently replacing it.
         if !renew {
@@ -250,6 +256,7 @@ fn prepare_in(resource: &Path, root: &Path, renew: bool) -> Result<(Config, Stri
             root.join("active-enrollment.json").to_string_lossy().into(),
         ),
     ]);
+    env.extend(asr_settings);
     if let Some(cli) = crate::codex::codex_candidates()
         .into_iter()
         .find(|s| Path::new(s).is_absolute() && Path::new(s).is_file())
@@ -410,12 +417,17 @@ mod tests {
         let (first, _) = prepare_in(&resource, &root, false).unwrap();
         let mut initial = environment(&first.environment_file).unwrap();
         initial.insert("PASSPORT_METER_ADDRESSES".into(), "192.0.2.1".into());
+        initial.insert("PASSPORT_ASR_URL".into(), "wss://asr.example.test/".into());
+        initial.insert("PASSPORT_ASR_TOKEN".into(), "test-token-for-rebinding-only".into());
         let before = serde_json::to_vec(&initial).unwrap();
         fs::write(&first.environment_file, &before).unwrap();
         assert!(prepare_in(&resource, &root, false).is_err());
         assert_eq!(fs::read(&first.environment_file).unwrap(), before);
         let (renewed, address) = prepare_in(&resource, &root, true).unwrap();
         let after = environment(&renewed.environment_file).unwrap();
+        for name in ["PASSPORT_ASR_URL", "PASSPORT_ASR_TOKEN"] {
+            assert_eq!(initial[name], after[name]);
+        }
         assert_ne!(
             initial["PASSPORT_DEVICE_TOKEN"],
             after["PASSPORT_DEVICE_TOKEN"]

@@ -11,6 +11,9 @@ import { AccountQuota } from './quota.mjs';
 import { encodeDeviceMessage } from './device-message.mjs';
 import { DeviceChats, loadChatTarget, saveChatTarget } from './device-chats.mjs';
 import { ChatContent, chatContent, chatMessages } from './chat-content.mjs';
+import { TextSubmission } from './text-submission.mjs';
+import { VoiceSession } from './voice-session.mjs';
+import { funAsrConfig, transcribePcm } from './funasr.mjs';
 
 const demo = process.argv.includes('--demo');
 const simulator = process.argv.includes('--simulator');
@@ -19,12 +22,15 @@ const desktop = process.argv.includes('--desktop');
 if (desktop && demo) throw new Error('Desktop and demo modes are incompatible');
 const config = networkConfig(process.env, { demo, simulator, lan });
 const { host, port, token, deviceToken } = config;
+const asrConfig = funAsrConfig(process.env);
 let enrollment;
 let device;
 let app;
 let session;
 let quota;
 let deviceChats;
+let textSubmission;
+let voice;
 let selectedChatTitle = null;
 let selectingChat = false;
 let contentReader, contentText = '', contentReadAt = 0, contentVersion = 0;
@@ -84,6 +90,7 @@ function askAssistantQuestion(questions) {
   if (!app.threadId || app.closed || !device || device.readyState !== 1 || queue.current()) throw new Error('Device unavailable or busy');
   if (!Array.isArray(questions) || questions.length !== 1 || questions[0]?.options?.length < 2) throw new Error('A single choice question required');
   const id = `assistant-question-${randomUUID()}`;
+  voice?.invalidate(); textSubmission?.invalidate();
   const request = queue.add({ id, method: 'item/tool/requestUserInput', params: {
     threadId: app.threadId, turnId: 'assistant-question', questions
   } });
@@ -113,6 +120,7 @@ function publish() {
     ...(queue.current() ?? { ...(session?.snapshot() ?? { type: 'status', state: 'idle' }), clearApproval: true }),
     threadId: session?.threadId ?? null, threadTitle: session?.threadTitle ?? '',
     synced: desktop ? !app?.closed && app?.state !== undefined : true,
+    voiceAvailable: !!voice?.transcribe,
     ...(queue.current() ? {} : { content: contentText, messages: contentMessages }),
     quota: limits ? { ...limits, lines: [lineFor(limits.primary), lineFor(limits.secondary)] } : null
   }) ?? JSON.stringify({ type: 'error', message: '请求过长，请在电脑处理' }));
@@ -178,12 +186,39 @@ ws.on('connection', client => {
   client.on('pong', () => { client.alive = true; });
   if (demo) demoRequest(); else { if (desktop) replayDesktop(); publish(); }
   void refreshContent();
-  client.on('message', async raw => {
+  client.on('message', async (raw, binary) => {
     let chatRequestId;
     let historyThreadId;
     try {
+      if (binary) {
+        if (!voice || queue.current() || selectingChat) throw new Error('Audio unavailable');
+        voice.receive(raw); return;
+      }
       const m = JSON.parse(raw.toString());
       if (m.type === 'ready') { if (desktop) replayDesktop(); publish(); return; }
+      if (['voiceStart', 'voiceStop', 'voiceCancel', 'voicePage', 'voiceConfirm'].includes(m.type)) {
+        if (!voice || queue.current() || selectingChat) throw new Error('Voice unavailable');
+        const generation = deviceGeneration;
+        let result;
+        if (m.type === 'voiceStart') result = voice.start(m.threadId);
+        else {
+          if (m.id !== voice.current?.id) throw new Error('Stale recording');
+          if (m.type === 'voiceStop') result = await voice.stop(m.id);
+          else if (m.type === 'voiceCancel') result = voice.cancel(m.id);
+          else if (m.type === 'voicePage') result = voice.snapshot(m.page);
+          else result = await voice.confirm(m.id, m.submissionId);
+        }
+        if (result && device === client && generation === deviceGeneration) client.send(JSON.stringify(result));
+        return;
+      }
+      if (['textPrepare', 'textConfirm', 'textCancel'].includes(m.type)) {
+        if (!textSubmission || selectingChat || queue.current()) throw new Error('Submission unavailable');
+        const generation = deviceGeneration;
+        const result = m.type === 'textPrepare' ? textSubmission.prepare(m.text) :
+          m.type === 'textCancel' ? textSubmission.cancel(m.id) : await textSubmission.confirm(m.id);
+        if (result && device === client && generation === deviceGeneration) client.send(JSON.stringify(result));
+        return;
+      }
       if (m.type === 'history') {
         if (!Number.isInteger(m.requestId) || m.requestId < 0 || m.requestId > 0xffffffff) throw new Error('Invalid history request');
         chatRequestId = m.requestId;
@@ -228,7 +263,7 @@ ws.on('connection', client => {
     } catch { if (device === client && client.readyState === 1) { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求', ...(chatRequestId === undefined ? {} : { requestId: chatRequestId }), ...(historyThreadId === undefined ? {} : { threadId: historyThreadId }) })); publish(); } }
   });
   client.on('error', () => client.terminate());
-  client.on('close', () => { if (device === client) { device = undefined; deviceChats?.invalidate(); contentReader?.invalidateHistory(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
+  client.on('close', () => { if (device === client) { device = undefined; voice?.invalidate(); textSubmission?.invalidate(); deviceChats?.invalidate(); contentReader?.invalidateHistory(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
 });
 let stopping = false;
 let reconnectTimer;
@@ -243,6 +278,7 @@ function scheduleDesktopReconnect() {
 function forwardDesktop(request, state) {
   if (!device || queue.requests.has(String(request.id))) return;
   try {
+    voice?.invalidate(); textSubmission?.invalidate();
     const item = (state.turns ?? []).flatMap(turn => turn.items ?? []).find(item => item.id === request.params.itemId);
     const normalized = queue.add(request, item, session.cwd);
     if (Buffer.byteLength(JSON.stringify(normalized)) > 3500) queue.invalidate(normalized.requestId);
@@ -267,9 +303,14 @@ if (desktop) {
   handleDesktopControl = desktopControl({ config, app, chats,
     askQuestion: askAssistantQuestion, getQuestion: questionState, getQuota: () => quota?.snapshot() ?? null });
   session = new PassportSession(app, publish);
+  textSubmission = new TextSubmission(app);
+  voice = new VoiceSession({ app, submission: textSubmission,
+    transcribe: asrConfig ? (pcm, options) => transcribePcm(asrConfig, pcm, options) : null,
+    emit: message => { if (device?.readyState === 1) device.send(JSON.stringify(message)); } });
   session.threadId = app.threadId;
   session.threadTitle = savedChat?.title ?? titleFor(app.threadId);
   app.on('selected', threadId => {
+    voice.invalidate(); textSubmission.invalidate();
     contentReader.invalidateHistory();
     contentText = ''; contentMessages = []; contentReadAt = 0; contentVersion++; contentLive = false;
     queue.requests.clear(); session.threadId = threadId; session.turnId = null;
@@ -280,6 +321,7 @@ if (desktop) {
   });
   app.on('resolved', id => { queue.invalidate(id); publish(); });
   app.on('state', state => {
+    if (voice.current && !voice.targetValid(voice.current)) voice.invalidate();
     const content = chatContent(state);
     contentLive = !!content;
     if (content) { contentText = content; contentMessages = chatMessages(state); contentVersion++; }
@@ -292,6 +334,7 @@ if (desktop) {
   });
   app.on('request', (request, state) => forwardDesktop(request, state));
   app.on('closed', () => {
+    voice.invalidate(); textSubmission.invalidate();
     queue.requests.clear(); session.state = 'failed'; publish();
     if (!stopping) scheduleDesktopReconnect();
   });

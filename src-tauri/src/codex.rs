@@ -29,6 +29,11 @@ impl CodexService {
         Self { client: None }
     }
 
+    /// Drops the app-server connection; its `Drop` kills the child process.
+    pub fn disconnect(&mut self) {
+        self.client = None;
+    }
+
     pub fn refresh(&mut self) -> UsageSnapshot {
         match self.fetch_with_reconnect() {
             Ok(snapshot) => snapshot,

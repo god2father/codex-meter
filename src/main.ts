@@ -7,44 +7,17 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import "./style.css";
 
-let pairingCode = "";
-let pairingExpiresAt = 0;
-let pairingError = "";
-let pairingBusy = false;
 
 type UsageStatus = "ok" | "limit_reached" | "unavailable" | "signed_out" | "api_key_unsupported" | "stale" | "error";
 type DataFreshness = "fresh" | "reconnecting" | "expired" | "loading" | "unavailable";
 type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "neutral";
 type RuntimePlatform = "windows" | "macos" | "other";
 
-interface PassportConfig { runtime: string; script: string; environmentFile: string }
-interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; message: string }
-let passport: PassportStatus = { config: { runtime: "", script: "", environmentFile: "" }, running: false, connected: false, message: "已关闭" };
-let passportBusy = false;
-let passportReading = false;
-let passportRevision = 0;
-let passportError = "";
-let lastView = "";
-function escapePassport(value: string): string {
+type UsageSource = "codex" | "claude";
+interface Monitoring { codex: boolean; claude: boolean }
+
+function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
-}
-async function passportCommand(command: string, args?: Record<string, unknown>): Promise<void> {
-  const reading = command === "passport_status";
-  if (!isTauri || passportBusy || (reading && passportReading)) return;
-  const previous = JSON.stringify(passport);
-  const previousError = passportError;
-  const revision = reading ? passportRevision : ++passportRevision;
-  if (reading) passportReading = true;
-  else { passportBusy = true; passportError = ""; render(); }
-  try {
-    const status = await invoke<PassportStatus>(command, args);
-    if (revision === passportRevision) { passport = status; passportError = ""; }
-  } catch (error) { if (revision === passportRevision) passportError = String(error); }
-  finally {
-    if (reading) passportReading = false;
-    else passportBusy = false;
-    if (!reading || previous !== JSON.stringify(passport) || previousError !== passportError) render();
-  }
 }
 
 interface LimitWindow {
@@ -204,6 +177,11 @@ let tokenError = "";
 let tokenDetailsOpen = false;
 let claudeSnapshot: ClaudeUsageSnapshot | null = isTauri ? null : mockClaudeSnapshot;
 let claudeDetailsOpen = false;
+// Matches the backend default until monitoring_status answers; the browser preview shows both.
+let monitoring: Monitoring = isTauri ? { codex: true, claude: false } : { codex: true, claude: true };
+let monitoringBusy: UsageSource | null = null;
+let monitoringError = "";
+let lastView = "";
 let errorMessage = "";
 let settingsOpen = false;
 let autostartEnabled = !isTauri;
@@ -361,6 +339,7 @@ function statusCopy(freshness = dataFreshness()): { label: string; detail: strin
 }
 
 function footerStatusCopy(freshness = dataFreshness()): string {
+  if (!monitoring.codex) return monitoring.claude ? "仅监测 Claude Code" : "监测已全部关闭";
   if (freshness === "fresh" && snapshot) return `Codex 额度 · ${formatUpdated(snapshot.fetchedAt)}`;
   if (freshness === "reconnecting" && snapshot) {
     const action = refreshing && !errorMessage ? "正在同步" : "正在重连";
@@ -472,12 +451,32 @@ function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" |
   return `<svg aria-hidden="true" viewBox="0 0 24 24">${paths[name]}</svg>`;
 }
 
+const SOURCE_LABEL: Record<UsageSource, string> = { codex: "Codex 额度监测", claude: "Claude 用量监测" };
+
+function sourceSwitch(source: UsageSource): string {
+  const busy = monitoringBusy === source;
+  return `<label class="setting-toggle source-switch" title="${monitoring[source] ? "关闭" : "开启"}${SOURCE_LABEL[source]}"><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] ? "checked" : ""} ${busy ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
+}
+
+function renderMonitorOff(source: UsageSource): string {
+  const [title, mark, copy] = source === "codex"
+    ? ["Codex", icon("app"), "额度与 Token 监测已关闭，不会启动 Codex 后台服务。"]
+    : ["Claude Code", icon("spark"), "开启后读取本机 Claude Code 记录中的 Token 数字，不读取对话内容。"];
+  return `<section class="token-card monitor-off${source === "claude" ? " claude-card" : ""}" aria-label="${title} 监测已关闭">
+    <div class="token-card-head">
+      <div><span class="token-mark${source === "claude" ? " claude-mark" : ""}">${mark}</span><strong>${title}</strong></div>
+      ${sourceSwitch(source)}
+    </div>
+    <p class="token-note">${copy}</p>
+  </section>`;
+}
+
 function renderQuota(): string {
   const data = snapshot;
   const windows = [data?.primary, data?.secondary].filter(Boolean) as LimitWindow[];
   const status = statusCopy();
   return `<section class="quota-strip" aria-label="订阅剩余额度">
-    <div class="section-caption"><span>剩余额度</span><span>${data?.planType ? escapePassport(formatPlan(data.planType)) : "Codex"}${data?.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</span></div>
+    <div class="section-caption"><span>Codex 剩余额度</span><span class="caption-end"><span>${data?.planType ? escapeHtml(formatPlan(data.planType)) : ""}${data?.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</span>${sourceSwitch("codex")}</span></div>
     ${windows.length ? `<div class="quota-grid">${windows.map(item => {
       const value = remainingOf(item);
       return `<div class="quota-window" data-tone="${usageTone(value)}">
@@ -485,25 +484,7 @@ function renderQuota(): string {
         <div class="quota-track" role="meter" aria-label="${formatWindow(item.windowDurationMins)}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
         <span class="reset-time">${formatReset(item.resetsAt)}</span>
       </div>`;
-    }).join("")}</div>` : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapePassport(status.label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
-  </section>`;
-}
-
-function passportStateLabel(): string {
-  return passport.failed ? "启动失败" : passportError ? "连接异常" : passport.connected ? "设备已连接" : passport.running ? "等待设备" : "已关闭";
-}
-
-function renderPassport(): string {
-  const tone = passportError || passport.failed ? "error" : passport.connected ? "connected" : passport.running ? "waiting" : "offline";
-  const label = passportBusy ? "正在处理" : passportStateLabel();
-  return `<section class="passport-card passport-compact" data-connection="${tone}" aria-label="Passport 连接">
-    <div class="passport-inline">
-      <span class="caption-title">${icon("device")}Passport</span>
-      <span class="connection-pill" role="status"><i></i>${label}</span>
-      <label class="setting-toggle passport-switch"><input type="checkbox" data-setting="passport" aria-label="Passport 连接开关" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
-      <button class="icon-button" data-action="passport-setup" title="Passport 设置" aria-label="Passport 设置">${icon("settings")}</button>
-    </div>
-    ${passportError ? `<p class="inline-error" role="alert">${escapePassport(passportError)}</p>` : ""}
+    }).join("")}</div>` : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapeHtml(status.label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
   </section>`;
 }
 
@@ -513,17 +494,14 @@ function renderSettings(): string {
     <div class="settings-group">
       <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>登录时启动</span><small>自动驻留托盘</small></span></span><input type="checkbox" data-setting="autostart" aria-label="登录时启动" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
     </div>
-    ${autostartError ? `<p class="inline-error" role="alert">${escapePassport(autostartError)}</p>` : ""}
+    ${autostartError ? `<p class="inline-error" role="alert">${escapeHtml(autostartError)}</p>` : ""}
     <p class="setting-note">外观跟随系统。Codex 额度在后台每分钟刷新，面板打开时每 30 秒；Token 统计每 10–30 秒。</p>
-    <div class="section-caption settings-caption"><span>Passport</span></div>
+    <div class="section-caption settings-caption"><span>监测</span></div>
     <div class="settings-group">
-      <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>Bridge 连接</span><small>${escapePassport(passportBusy ? "正在处理" : passportStateLabel())} · 手动开启局域网服务</small></span></span><input type="checkbox" data-setting="passport" aria-label="Bridge 连接" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
-      <button class="setting-row setting-button" data-action="passport-bind" ${passportBusy || !isTauri ? "disabled" : ""}><span class="setting-label"><i>${icon("device")}</i><span class="setting-copy"><span>${pairingBusy ? "正在准备…" : pairingCode ? "刷新绑定码" : "绑定设备"}</span><small>手机页面输入绑定码，完成无线连接</small></span></span>${icon("chevronRight")}</button>
+      ${(["codex", "claude"] as UsageSource[]).map(source => `<label class="setting-row setting-toggle"><span class="setting-label"><i>${icon(source === "codex" ? "app" : "spark")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${source === "codex" ? "订阅额度与本机 Codex Token" : "本机 ~/.claude 记录中的 Token"}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] ? "checked" : ""} ${monitoringBusy === source ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`).join("")}
     </div>
-    ${passportError || (passport.message && passport.message !== passportStateLabel()) ? `<p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>` : ""}
-    ${pairingError ? `<p class="inline-error" role="alert">${escapePassport(pairingError)}</p>` : ""}
-    ${pairingCode ? `<div class="pairing-code pairing-code--pin" aria-label="电脑绑定码">${escapePassport(pairingCode)}</div><p class="setting-note">手机加入 Passport 热点，在自动打开的配网页面填写此码，再选择与电脑相同的 Wi-Fi。验证通过后，在设备上确认保存。绑定码有效期 5 分钟，电脑会自动验证，无需在 Meter 上确认。</p><button class="text-button" data-action="passport-hide-code">收起绑定码</button>` : ""}
-    <p class="settings-footnote">Bridge 默认关闭。配网与电脑绑定均通过手机完成，无需 USB。</p>
+    ${monitoringError ? `<p class="inline-error" role="alert">${escapeHtml(monitoringError)}</p>` : ""}
+    <p class="settings-footnote">关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
   </section>`;
 }
 
@@ -607,7 +585,13 @@ function formatClaudeReset(unixSeconds: number): string {
 
 function renderClaudeUsage(): string {
   const data = claudeSnapshot;
-  if (isTauri && data && !data.sourceAvailable) return "";
+  if (!monitoring.claude) return renderMonitorOff("claude");
+  if (isTauri && data && !data.sourceAvailable) {
+    return `<section class="token-card claude-card" aria-label="Claude 用量">
+      <div class="token-card-head"><div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div>${sourceSwitch("claude")}</div>
+      <p class="token-note">尚未发现本机 Claude Code 记录</p>
+    </section>`;
+  }
   const available = Boolean(data?.sourceAvailable);
   const block = data?.currentBlock ?? null;
   const session = data?.currentSession ?? null;
@@ -626,9 +610,9 @@ function renderClaudeUsage(): string {
     <section class="token-card claude-card" aria-label="Claude 用量">
       <div class="token-card-head">
         <div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div>
-        <button class="token-detail-button" data-action="claude-details" aria-expanded="${claudeDetailsOpen}" aria-controls="claude-details">
+        <span class="caption-end"><button class="token-detail-button" data-action="claude-details" aria-expanded="${claudeDetailsOpen}" aria-controls="claude-details">
           ${claudeDetailsOpen ? "收起" : "明细"}${icon("chevron")}
-        </button>
+        </button>${sourceSwitch("claude")}</span>
       </div>
       <div class="token-summary-grid" role="group" aria-label="Claude 用量摘要（输入加输出）">
         ${tokenStat("5 小时窗口", io(block), available && Boolean(block), Boolean(block))}
@@ -643,7 +627,7 @@ function renderClaudeUsage(): string {
             <thead><tr><th scope="col">分类</th><th scope="col">5 小时</th><th scope="col">今日</th><th scope="col">会话</th></tr></thead>
             <tbody>${row("输入", "inputTokens")}${row("缓存写", "cacheCreationTokens")}${row("缓存读", "cacheReadTokens")}${row("输出", "outputTokens")}${row("总计", "totalTokens")}</tbody>
           </table>
-          ${data?.models.length ? `<p class="claude-models">今日模型 · ${data.models.map(item => `${escapePassport(formatModel(item.model))} ${formatTokenSummary(item.totalTokens)}`).join(" · ")}</p>` : ""}
+          ${data?.models.length ? `<p class="claude-models">今日模型 · ${data.models.map(item => `${escapeHtml(formatModel(item.model))} ${formatTokenSummary(item.totalTokens)}`).join(" · ")}</p>` : ""}
         </div>` : ""}
       <p class="token-note" role="note">${note}</p>
     </section>`;
@@ -651,7 +635,7 @@ function renderClaudeUsage(): string {
 
 function render(): void {
   const freshness = dataFreshness();
-  const state = freshness === "fresh" ? snapshot?.status === "limit_reached" ? "error" : "ok" : freshness;
+  const state = !monitoring.codex ? "paused" : freshness === "fresh" ? snapshot?.status === "limit_reached" ? "error" : "ok" : freshness;
   const view = settingsOpen ? "settings" : "home";
   const changedView = view !== lastView;
   lastView = view;
@@ -664,13 +648,13 @@ function render(): void {
   app.innerHTML = `<div class="panel-shell">
     <section class="glass-card main-card" data-state="${state}" data-view="${view}" aria-label="Codex Meter">
       <header class="panel-header">
-        <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${settingsOpen ? "你的桌面，按你的习惯" : "桌面连接 · 用量一览"}</span></div></div>
+        <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${settingsOpen ? "你的桌面，按你的习惯" : "Codex · Claude 用量"}</span></div></div>
         <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
-        ${settingsOpen ? renderSettings() : `${renderQuota()}${renderTokenUsage()}${renderClaudeUsage()}${renderPassport()}`}
+        ${settingsOpen ? renderSettings() : `${monitoring.codex ? `${renderQuota()}${renderTokenUsage()}` : renderMonitorOff("codex")}${renderClaudeUsage()}`}
       </div>
-      <footer class="panel-footer"><div class="updated" role="status" title="${escapePassport(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : "alert")}<span>${escapePassport(footerStatusCopy())}</span></div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
+      <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy())}</span></div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
   </div>`;
   if (!changedView) {
@@ -779,7 +763,47 @@ async function requestBackgroundRefresh(includeQuota: boolean): Promise<void> {
 }
 
 async function refreshAllUsage(): Promise<void> {
-  await Promise.all([refreshUsage(), requestBackgroundRefresh(false)]);
+  await Promise.all([monitoring.codex ? refreshUsage() : Promise.resolve(), requestBackgroundRefresh(false)]);
+}
+
+async function loadMonitoring(): Promise<void> {
+  if (!isTauri) return;
+  try {
+    monitoring = await invoke<Monitoring>("monitoring_status");
+  } catch {
+    // Keep defaults; the backend applies the same ones.
+  }
+  render();
+  void updateTrayIcon(snapshot);
+}
+
+async function setMonitoring(source: UsageSource, enabled: boolean): Promise<void> {
+  if (monitoringBusy) return;
+  if (!isTauri) {
+    // Browser preview has no backend; flip locally so both states can be inspected.
+    monitoring = { ...monitoring, [source]: enabled };
+    render();
+    return;
+  }
+  monitoringBusy = source;
+  monitoringError = "";
+  render();
+  try {
+    monitoring = await invoke<Monitoring>("set_monitoring", { source, enabled });
+    if (source === "codex" && enabled) {
+      loading = !hasUsage(snapshot);
+      tokenLoading = !tokenSnapshot;
+    }
+    if (source === "claude" && !enabled) claudeSnapshot = null;
+    if (source === "codex" && !enabled) errorMessage = "";
+  } catch (error) {
+    monitoringError = error instanceof Error ? error.message : String(error);
+  } finally {
+    monitoringBusy = null;
+    render();
+    app.querySelector<HTMLInputElement>(`input[data-monitor="${source}"]`)?.focus();
+    void updateTrayIcon(snapshot);
+  }
 }
 
 async function refreshUsage(): Promise<void> {
@@ -829,7 +853,7 @@ function applyCodexSnapshot(next: UsageSnapshot): void {
 
 function claudeTooltip(): string {
   const data = claudeSnapshot;
-  if (!data?.sourceAvailable) return "";
+  if (!monitoring.claude || !data?.sourceAvailable) return "";
   const value = data.currentBlock ?? data.today;
   const block = `${data.currentBlock ? "5 小时" : "今日"} ${formatTokenSummary(value.inputTokens + value.outputTokens)}`;
   return `\nClaude · ${block}`;
@@ -845,6 +869,9 @@ interface TrayPresentation {
 }
 
 function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
+  if (!monitoring.codex) {
+    return { mood: "sleeping", remaining: 0, color: "#7890aa", alertDot: false, title: "—", tooltip: "Codex 额度监测已关闭" };
+  }
   const tightest = data ? tightestWindow(data) : null;
   const freshness = dataFreshness();
   if (!data || !tightest) {
@@ -1177,21 +1204,6 @@ app.addEventListener("click", async (event) => {
   const button = (event.target as Element).closest<HTMLButtonElement>("button[data-action]");
   if (!button) return;
   switch (button.dataset.action) {
-    case "passport-setup":
-      settingsOpen = true;
-      render();
-      break;
-    case "passport-toggle":
-      await passportCommand("passport_toggle", { enabled: !passport.running });
-      app.querySelector<HTMLButtonElement>('[data-action="passport-toggle"]')?.focus();
-      break;
-    case "passport-bind":
-      await generatePairing();
-      break;
-    case "passport-hide-code":
-      pairingCode = "";
-      render();
-      break;
     case "refresh":
       await refreshAllUsage();
       break;
@@ -1228,10 +1240,8 @@ app.addEventListener("click", async (event) => {
 });
 
 app.addEventListener("change", (event) => {
-  const toggle = (event.target as Element).closest<HTMLInputElement>('input[data-setting="passport"]');
-  if (toggle) {
-    void passportCommand("passport_toggle", { enabled: toggle.checked });
-  }
+  const monitor = (event.target as Element).closest<HTMLInputElement>("input[data-monitor]");
+  if (monitor) void setMonitoring(monitor.dataset.monitor as UsageSource, monitor.checked);
   const input = (event.target as Element).closest<HTMLInputElement>('input[data-setting="autostart"]');
   if (input) void setAutostart(input.checked);
 });
@@ -1239,17 +1249,14 @@ app.addEventListener("change", (event) => {
 render();
 
 if (isTauri) {
-  void passportCommand("passport_status");
-  window.setInterval(() => {
-    if (document.visibilityState === "visible" && !passportBusy) void passportCommand("passport_status");
-  }, 3000);
+  void loadMonitoring();
   document.addEventListener("contextmenu", (event) => event.preventDefault());
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") void invoke("hide_panel").catch(() => undefined);
   });
   // The Rust scheduler owns the refresh cadence so updates keep flowing while the panel is hidden.
   void listen<UsageSnapshot>("usage://codex", ({ payload }) => {
-    if (refreshing) return;
+    if (refreshing || !monitoring.codex) return;
     try {
       applyCodexSnapshot(normalizeSnapshot(payload));
     } catch (error) {
@@ -1266,6 +1273,7 @@ if (isTauri) {
     render();
   });
   void listen<ClaudeUsageSnapshot>("usage://claude", ({ payload }) => {
+    if (!monitoring.claude) return;
     const hadClaude = Boolean(claudeSnapshot?.sourceAvailable);
     claudeSnapshot = payload;
     render();
@@ -1303,15 +1311,3 @@ window.setInterval(() => {
 themeQuery.addEventListener("change", () => {
   void updateTrayIcon(snapshot);
 });
-
-async function generatePairing(): Promise<void> {
-  if (passportBusy || !isTauri) return;
-  passportBusy = true; ++passportRevision; pairingBusy = true; pairingError = ""; pairingCode = ""; render();
-  try {
-    const value = await invoke<{ code: string; expiresAt: number }>("passport_enrollment");
-    pairingCode = value.code; pairingExpiresAt = value.expiresAt;
-    passport = await invoke<PassportStatus>("passport_status");
-    setTimeout(() => { if (Date.now() >= pairingExpiresAt && pairingCode) { pairingCode = ""; pairingError = "绑定码已过期，请重新点击绑定设备。"; render(); } }, Math.max(0, pairingExpiresAt - Date.now()));
-  } catch (error) { pairingError = String(error); }
-  finally { passportBusy = false; pairingBusy = false; render(); }
-}

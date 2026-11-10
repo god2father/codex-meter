@@ -51,7 +51,7 @@ h1, h2, p { margin: 0; }
 .glass-card::after { content: ""; position: absolute; pointer-events: none; inset: 1px; border-radius: 29px; border: 1px solid rgba(255,255,255,.15); box-shadow: inset 1px 0 1px rgba(255,255,255,.3), inset -1px 0 1px rgba(255,255,255,.12); }
 .panel-header, .panel-scroll, .panel-footer { position: relative; z-index: 1; }
 .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 20px 20px 15px; }
-.brand-line, .header-actions, .section-caption, .caption-title, .quota-heading, .passport-actions, .updated, .setting-row, .setting-label { display: flex; align-items: center; }
+.brand-line, .header-actions, .section-caption, .quota-heading, .updated, .setting-row, .setting-label { display: flex; align-items: center; }
 .brand-line { gap: 10px; min-width: 0; }
 h1 { font-size: 17px; line-height: 1.3; letter-spacing: -.55px; font-weight: 680; }
 .brand-subtitle { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); letter-spacing: .15px; }
@@ -90,41 +90,7 @@ h1 { font-size: 17px; line-height: 1.3; letter-spacing: -.55px; font-weight: 680
 .reset-time { display: block; font-size: 11px; color: var(--subtle); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .quota-empty { display: flex; align-items: center; gap: 8px; padding: 8px 0; font-size: 12px; color: var(--muted); }
 .quota-empty .text-button { margin-left: auto; }
-.passport-card { position: relative; overflow: hidden; border: 1px solid var(--edge); border-radius: 23px; padding: 15px 17px 13px; background: linear-gradient(145deg, rgba(255,255,255,.17), rgba(255,255,255,.04)); box-shadow: inset 0 1px 0 rgba(255,255,255,.4), 0 3px 12px rgba(28,62,73,.04); }
-.caption-title { gap: 5px; color: var(--text); font-size: 12px; }
-.caption-title svg { width: 15px; height: 15px; color: var(--muted); }
-.connection-pill { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 20px; background: var(--surface); font-size: 10px; white-space: nowrap; font-weight: 500; color: var(--muted); }
-.connection-pill i { width: 4px; height: 4px; border-radius: 50%; background: var(--subtle); }
-[data-connection="connected"] .connection-pill, .connection-pill[data-on="true"] { color: var(--accent); border-color: rgba(25,184,143,.2); }
-[data-connection="connected"] .connection-pill i, .connection-pill[data-on="true"] i { background: var(--accent-fill); box-shadow: 0 0 5px #19b88f55; }
-[data-connection="waiting"] .connection-pill i { background: #d39739; animation: breathe 1.6s ease-in-out infinite; }
-[data-connection="error"] .connection-pill { color: var(--danger); }
-[data-connection="error"] .connection-pill i { background: var(--danger); }
-.connection-scene { display: flex; align-items: center; justify-content: center; gap: 15px; position: relative; height: 94px; isolation: isolate; }
-.scene-orbit { position: absolute; width: 164px; height: 73px; border-radius: 50%; border: 1px solid rgba(255,255,255,.38); transform: rotate(-12deg); z-index: -1; background: radial-gradient(ellipse, rgba(255,255,255,.15), transparent 70%); }
-.scene-node { position: relative; display: grid; place-items: center; width: 49px; height: 49px; border-radius: 16px; border: 1px solid var(--edge); background: linear-gradient(145deg, rgba(255,255,255,.65), rgba(255,255,255,.13)); box-shadow: 0 6px 13px rgba(38,72,81,.1), inset 0 1px 0 #fff9, inset 0 -1px 1px #506b7920; color: var(--muted); }
-.scene-node svg { width: 27px; height: 27px; stroke-width: 1.35; }
-.passport-node { transform: rotate(8deg); }
 .computer-node { transform: rotate(-8deg); }
-.scene-link { display: flex; gap: 5px; }
-.scene-link i { width: 3px; height: 3px; background: var(--subtle); opacity: .4; border-radius: 50%; }
-.device-light { position: absolute; bottom: 7px; width: 3px; height: 3px; border-radius: 50%; background: var(--subtle); opacity: .4; }
-[data-connection="connected"] .passport-node { color: var(--accent); }
-[data-connection="connected"] .device-light { background: var(--accent-fill); opacity: 1; box-shadow: 0 0 7px #19b88f; }
-[data-connection="connected"] .scene-link i { background: var(--accent-fill); opacity: .8; }
-[data-connection="waiting"] .scene-link i { animation: link-pulse 1.4s ease-in-out infinite; }
-[data-connection="waiting"] .scene-link i:nth-child(2) { animation-delay: .15s; }
-[data-connection="waiting"] .scene-link i:nth-child(3) { animation-delay: .3s; }
-.passport-card h2 { font-size: 18px; letter-spacing: -.5px; font-weight: 620; line-height: 1.4; text-align: center; }
-.passport-description { margin: 6px auto 15px; max-width: 252px; font-size: 11px; line-height: 1.7; text-align: center; color: var(--muted); }
-.passport-actions { justify-content: center; gap: 8px; }
-.glass-button { display: inline-flex; min-height: 38px; align-items: center; justify-content: center; gap: 7px; padding: 8px 16px; border: 1px solid var(--edge); border-radius: 999px; background: linear-gradient(155deg, rgba(255,255,255,.4), rgba(255,255,255,.1)); box-shadow: 0 4px 10px rgba(22,61,68,.08), inset 0 1px 0 rgba(255,255,255,.7); font-size: 12px; font-weight: 600; }
-.glass-button svg { width: 16px; height: 16px; transition: transform .25s var(--ease); }
-.primary-button { color: var(--accent); background: linear-gradient(155deg, rgba(202,248,230,.6), rgba(159,227,209,.18)); border-color: rgba(20,144,112,.23); }
-.primary-button:hover:not(:disabled) { background: linear-gradient(155deg, rgba(222,255,241,.7), rgba(140,231,205,.3)); box-shadow: 0 6px 16px #087b6520, inset 0 1px 0 #fffb; transform: translateY(-1px); }
-.primary-button:hover:not(:disabled) svg:last-child:not(:first-child) { transform: translateX(3px); }
-.primary-button:active:not(:disabled) { transform: translateY(0) scale(.97); }
-.passport-footnote { margin-top: 10px; text-align: center; color: var(--subtle); font-size: 9px; }
 .token-card { border: 1px solid var(--edge); border-radius: 17px; padding: 11px 13px 10px; background: var(--surface); box-shadow: inset 0 1px 0 #fff3; }
 .token-card-head, .token-card-head > div { display: flex; align-items: center; }
 .token-card-head { justify-content: space-between; }
@@ -196,12 +162,6 @@ h1 { font-size: 17px; line-height: 1.3; letter-spacing: -.55px; font-weight: 680
 .setting-note, .settings-footnote { color: var(--muted); font-size: 11px; line-height: 1.6; }
 .setting-note { margin: 8px 3px 0; overflow-wrap: anywhere; }
 .settings-footnote { margin: 16px 3px 0; }
-.passport-form { display: grid; gap: 12px; padding: 15px 0 0; animation: view-enter .25s var(--ease); }
-.passport-form label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; }
-.passport-form input { width: 100%; min-width: 0; min-height: 37px; border: 1px solid var(--line); border-radius: 11px; padding: 9px 11px; background: var(--surface); color: var(--text); font-size: 11px; user-select: text; transition: background .2s, border-color .2s; }
-.passport-form input::placeholder { color: var(--subtle); opacity: .8; }
-.passport-form input:focus { background: var(--hover); border-color: var(--accent-fill); }
-.passport-form .glass-button { justify-self: stretch; }
 [aria-busy="true"] svg:first-child { animation: spin .9s linear infinite; }
 .bubble-tail { position: absolute; z-index: 2; bottom: 3px; left: var(--tail-x); width: 10px; height: 10px; border-right: 1px solid var(--edge); border-bottom: 1px solid var(--edge); background: var(--glass); backdrop-filter: blur(26px); -webkit-backdrop-filter: blur(26px); pointer-events: none; transform: translateX(-50%) rotate(45deg); }
 html[data-panel-edge="top"] body { padding: 2px 14px 14px; }
@@ -218,19 +178,12 @@ html[data-panel-edge="right"] .bubble-tail { right: 3px; left: auto; border: 0; 
 html[data-runtime="browser"] body { overflow-y: auto; background: radial-gradient(ellipse at 5% 8%, #c6e8d7, transparent 52%), radial-gradient(ellipse at 90% 70%, #c2d9e9, transparent 54%), linear-gradient(145deg,#e9e9dd,#d6e2e3 65%,#ccd8e6); }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes view-enter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
-@keyframes breathe { 50% { opacity: .4; } }
-@keyframes link-pulse { 50% { opacity: 1; background: var(--accent-fill); } }
 @media (prefers-color-scheme: dark) {
   :root { --text: #edf3f5; --muted: #b2c5ce; --subtle: #a1b4bf; --accent: #9ce7cb; --accent-fill: #59cea8; --line: rgba(213,235,244,.13); --glass: rgba(18,34,43,.35); --surface: rgba(223,244,255,.035); --hover: rgba(224,247,255,.1); --edge: rgba(237,250,255,.23); --shadow: rgba(0,8,14,.35); --warning: #ecc783; --danger: #f7a4b3; --ok-fill: #59cea8; --warn-fill: #d39739; --crit-fill: #e06c7a; --claude: #e08a68; --track: rgba(213,235,244,.13); }
   .glass-card { background: linear-gradient(135deg, rgba(203,238,255,.07), transparent 45%, rgba(194,230,255,.025)), var(--glass); box-shadow: 0 14px 38px var(--shadow), inset 0 1px 0 #f1fcff33, inset 0 -1px 0 #e7f8ff0c; }
   .glass-card::before { opacity: .2; }
   .glass-card::after { border-color: #eafaff06; box-shadow: inset 1px 0 1px #fff2, inset -1px 0 1px #ffffff08; }
   .app-mark { background: linear-gradient(145deg,#d8f5ff12,#d6efff04); box-shadow: 0 3px 8px #0002, inset 0 1px 0 #fff3; }
-  .passport-card { background: linear-gradient(145deg,#d8f5ff06,#d6efff02); }
-  .scene-orbit { border-color: #def7ff12; background: radial-gradient(ellipse,#d4f6ff06,transparent 70%); }
-  .scene-node { background: linear-gradient(145deg,#d4edfa22,#def2ff04); box-shadow: 0 6px 14px #0003, inset 0 1px 0 #fff3, inset 0 -1px 1px #0002; }
-  .primary-button { background: linear-gradient(155deg,#8fdfbb28,#68c3a610); border-color: #9ce7cb38; box-shadow: 0 4px 10px #0002,inset 0 1px 0 #ffffff25; }
-  .primary-button:hover:not(:disabled) { background: linear-gradient(155deg,#9ae3be38,#68c3a622); }
   html[data-runtime="browser"] body { background: radial-gradient(ellipse at 5% 8%, #204b4a,transparent 52%),radial-gradient(ellipse at 90% 70%,#253d58,transparent 54%),linear-gradient(145deg,#182931,#172e3b 65%,#132839); }
 }
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
@@ -252,12 +205,7 @@ html[data-runtime="tauri"] .glass-card { box-shadow: inset 0 1px 0 rgba(255,255,
 
 html[data-panel-constrained="true"] .panel-scroll { max-height: calc(100vh - 130px); }
 
-.pairing-qr { display: block; width: 100%; max-width: 336px; margin: 12px auto; border-radius: 12px; }
 
-.passport-compact { padding: 12px; border-radius: 18px; }
-.passport-inline { display: flex; align-items: center; gap: 8px; }
-.passport-inline > .caption-title { margin-right: auto; font-size: 12px; font-weight: 600; }
-.passport-switch { display: flex; flex-shrink: 0; padding: 4px 0; }
 
 /* Control Center palette: clear outer glass, readable graphite content surfaces. */
 html[data-native-glass="liquid"] {
@@ -279,26 +227,22 @@ html[data-native-glass="liquid"] .glass-card::after { border-color: rgba(255,255
 /* Only text sitting directly on clear glass needs a shadow; graphite cards are readable as is. */
 html[data-native-glass="liquid"] .panel-header, html[data-native-glass="liquid"] .section-caption.settings-caption, html[data-native-glass="liquid"] .setting-note, html[data-native-glass="liquid"] .settings-footnote { text-shadow: 0 1px 2px rgba(0,0,0,.42); }
 html[data-native-glass="liquid"] h1 { font-weight: 650; }
-html[data-native-glass="liquid"] .quota-strip, html[data-native-glass="liquid"] .passport-card, html[data-native-glass="liquid"] .token-card, html[data-native-glass="liquid"] .settings-group {
+html[data-native-glass="liquid"] .quota-strip, html[data-native-glass="liquid"] .token-card, html[data-native-glass="liquid"] .settings-group {
   background: var(--surface); border: 1px solid var(--edge);
   box-shadow: inset 0 1px 1px rgba(255,255,255,.09), 0 3px 8px rgba(0,0,0,.14);
 }
-html[data-native-glass="liquid"] .icon-button, html[data-native-glass="liquid"] .glass-button {
+html[data-native-glass="liquid"] .icon-button {
   color: var(--text); background: rgba(58,61,70,.76); border: 1px solid rgba(229,235,245,.25);
   box-shadow: inset 0 1px 1px rgba(255,255,255,.12), 0 3px 7px rgba(0,0,0,.22);
 }
-html[data-native-glass="liquid"] .icon-button:hover, html[data-native-glass="liquid"] .glass-button:hover { background: var(--hover); }
-html[data-native-glass="liquid"] .icon-button svg, html[data-native-glass="liquid"] .glass-button svg { filter: none; stroke-width: 1.8; }
-html[data-native-glass="liquid"] .primary-button { background: #0878e5; border-color: #5ca9ff; color: #fff; }
+html[data-native-glass="liquid"] .icon-button:hover { background: var(--hover); }
+html[data-native-glass="liquid"] .icon-button svg { filter: none; stroke-width: 1.8; }
 html[data-native-glass="liquid"] .app-mark { background: #f7f8fa; color: #007aff; border-color: #fff; box-shadow: 0 4px 10px #0003; }
-html[data-native-glass="liquid"] .connection-pill { background: rgba(126,133,147,.2); color: var(--muted); border-color: rgba(233,240,250,.2); }
 html[data-native-glass="liquid"] .switch { background: #5a5d66; border-color: #747985; box-shadow: inset 0 1px 2px #0003; }
 html[data-native-glass="liquid"] .setting-toggle input:checked + .switch { background: #0a84ff; border-color: #62afff; }
 html[data-native-glass="liquid"] .switch i { background: #fff; box-shadow: 0 1px 3px #0004; }
 html[data-native-glass="liquid"] .reset-time, html[data-native-glass="liquid"] .token-note { color: var(--muted); }
 html[data-native-glass="liquid"] .text-button { color: #a9d2ff; }
-html[data-native-glass="liquid"] .passport-form input { background: rgba(34,37,45,.88); border-color: #6c7381; color: #fff; }
-.passport-switch { position: relative; cursor: pointer; }
 .setting-toggle:has(input:focus-visible) .switch { outline: 2px solid var(--accent-fill); outline-offset: 3px; }
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   html[data-native-glass="liquid"] .glass-card { background: #22252c; }
@@ -308,6 +252,13 @@ html[data-native-glass="liquid"] .passport-form input { background: rgba(34,37,4
 html[data-native-glass="liquid"] .updated { color: #f0f2f7; background: rgba(47,49,57,.72); border: 1px solid rgba(230,235,245,.18); padding: 5px 8px; border-radius: 10px; }
 html[data-native-glass="liquid"] .brand-subtitle { color: #fff; }
 
-.pairing-code { margin: 16px 0 6px; padding: 18px 12px; border-radius: 16px; background: rgba(0,0,0,.24); color: #fff; font: 600 20px ui-monospace, SFMono-Regular, monospace; letter-spacing: 1px; text-align: center; user-select: text; text-shadow: 0 1px 2px rgba(0,0,0,.35); }
 
-.pairing-code--pin { font-size: 36px; letter-spacing: 10px; padding-left: 22px; }
+
+/* Per-source monitoring switches. */
+.caption-end { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.source-switch { position: relative; display: flex; flex-shrink: 0; padding: 4px 0; cursor: pointer; }
+.source-switch .switch { width: 34px; height: 20px; }
+.source-switch .switch i { width: 14px; height: 14px; }
+.source-switch input:checked + .switch i { transform: translateX(14px); }
+.monitor-off .token-note { margin-top: 6px; }
+.monitor-off .token-card-head strong { color: var(--muted); }

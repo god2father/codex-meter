@@ -8,9 +8,12 @@ use crate::{
     codex::{CodexService, UsageSnapshot},
     token_usage,
 };
+use serde::{Deserialize, Serialize};
 use std::{
+    fs,
+    path::PathBuf,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Condvar, Mutex,
     },
     thread,
@@ -51,6 +54,30 @@ impl Cadence {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    Codex,
+    Claude,
+}
+
+/// Which sources are monitored. Codex keeps its previous always-on behaviour by default;
+/// Claude reads local transcripts, so it stays off until the user turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Monitoring {
+    pub codex: bool,
+    pub claude: bool,
+}
+
+impl Default for Monitoring {
+    fn default() -> Self {
+        Self {
+            codex: true,
+            claude: false,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Due {
     codex: Option<Instant>,
@@ -63,6 +90,9 @@ pub struct UsageHub {
     pub codex: Arc<Mutex<CodexService>>,
     claude: Mutex<ClaudeUsageService>,
     offset_east_seconds: AtomicI64,
+    codex_enabled: AtomicBool,
+    claude_enabled: AtomicBool,
+    preferences_path: Mutex<Option<PathBuf>>,
     due: Mutex<Due>,
     signal: Condvar,
 }
@@ -73,9 +103,79 @@ impl UsageHub {
             codex: Arc::new(Mutex::new(CodexService::new())),
             claude: Mutex::new(ClaudeUsageService::new()),
             offset_east_seconds: AtomicI64::new(0),
+            codex_enabled: AtomicBool::new(Monitoring::default().codex),
+            claude_enabled: AtomicBool::new(Monitoring::default().claude),
+            preferences_path: Mutex::new(None),
             due: Mutex::new(Due::default()),
             signal: Condvar::new(),
         })
+    }
+
+    pub fn monitoring(&self) -> Monitoring {
+        Monitoring {
+            codex: self.codex_enabled.load(Ordering::Relaxed),
+            claude: self.claude_enabled.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn is_enabled(&self, source: Source) -> bool {
+        match source {
+            Source::Codex => self.codex_enabled.load(Ordering::Relaxed),
+            Source::Claude => self.claude_enabled.load(Ordering::Relaxed),
+        }
+    }
+
+    fn apply(&self, monitoring: Monitoring) {
+        self.codex_enabled
+            .store(monitoring.codex, Ordering::Relaxed);
+        self.claude_enabled
+            .store(monitoring.claude, Ordering::Relaxed);
+    }
+
+    /// Reads saved switches from `<config dir>/monitoring.json`; a missing or broken file keeps defaults.
+    pub fn load_preferences(&self, directory: Option<PathBuf>) {
+        let path = directory.map(|directory| directory.join("monitoring.json"));
+        if let Some(saved) = path
+            .as_ref()
+            .and_then(|path| fs::read(path).ok())
+            .and_then(|bytes| serde_json::from_slice::<Monitoring>(&bytes).ok())
+        {
+            self.apply(saved);
+        }
+        if let Ok(mut stored) = self.preferences_path.lock() {
+            *stored = path;
+        }
+    }
+
+    pub fn set_enabled(&self, source: Source, enabled: bool) -> Result<(), String> {
+        let mut next = self.monitoring();
+        match source {
+            Source::Codex => next.codex = enabled,
+            Source::Claude => next.claude = enabled,
+        }
+        let path = self
+            .preferences_path
+            .lock()
+            .ok()
+            .and_then(|path| path.clone());
+        if let Some(path) = path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| format!("无法保存监测设置：{error}"))?;
+            }
+            let bytes = serde_json::to_vec_pretty(&next).map_err(|error| error.to_string())?;
+            fs::write(&path, bytes).map_err(|error| format!("无法保存监测设置：{error}"))?;
+        }
+        self.apply(next);
+        if source == Source::Codex && !enabled {
+            // Stop the background `codex app-server` instead of leaving it idle.
+            if let Ok(mut service) = self.codex.lock() {
+                service.disconnect();
+            }
+        }
+        if enabled {
+            self.kick(source == Source::Codex);
+        }
+        Ok(())
     }
 
     pub fn set_timezone(&self, offset_east_seconds: i64) {
@@ -133,20 +233,25 @@ impl UsageHub {
     pub fn read_local(
         &self,
     ) -> (
-        Result<token_usage::TokenUsageSnapshot, String>,
+        Option<Result<token_usage::TokenUsageSnapshot, String>>,
         Option<claude_usage::ClaudeUsageSnapshot>,
     ) {
         let now = claude_usage::unix_now();
         let day_start = self.day_start(now);
-        let codex_tokens = token_usage::read(
-            &claude_usage::format_iso_utc(day_start),
-            day_start.max(0) as u64,
-        );
-        let claude = self
-            .claude
-            .lock()
-            .ok()
-            .map(|mut service| service.read(now, day_start));
+        let codex_tokens = self.is_enabled(Source::Codex).then(|| {
+            token_usage::read(
+                &claude_usage::format_iso_utc(day_start),
+                day_start.max(0) as u64,
+            )
+        });
+        let claude = if self.is_enabled(Source::Claude) {
+            self.claude
+                .lock()
+                .ok()
+                .map(|mut service| service.read(now, day_start))
+        } else {
+            None
+        };
         (codex_tokens, claude)
     }
 
@@ -163,7 +268,7 @@ impl UsageHub {
         loop {
             let (run_codex, run_local) = self.wait_for_work(&mut last_tick);
             let visible = panel_visible(&app);
-            if run_codex {
+            if run_codex && self.is_enabled(Source::Codex) {
                 let snapshot = self.refresh_codex();
                 let succeeded = snapshot.error.is_none()
                     && matches!(snapshot.status.as_str(), "ok" | "limit_reached");
@@ -172,14 +277,15 @@ impl UsageHub {
             }
             if run_local {
                 let (tokens, claude) = self.read_local();
-                let succeeded = tokens.is_ok();
+                let succeeded = !matches!(tokens, Some(Err(_)));
                 match tokens {
-                    Ok(snapshot) => {
+                    Some(Ok(snapshot)) => {
                         let _ = app.emit("usage://tokens", &snapshot);
                     }
-                    Err(error) => {
+                    Some(Err(error)) => {
                         let _ = app.emit("usage://tokens-error", error);
                     }
+                    None => {}
                 }
                 if let Some(snapshot) = claude {
                     let _ = app.emit("usage://claude", &snapshot);
@@ -271,6 +377,42 @@ mod tests {
         assert_eq!(hub.wait_for_work(&mut tick), (false, true));
         hub.kick(true);
         assert_eq!(hub.wait_for_work(&mut tick), (true, true));
+    }
+
+    #[test]
+    fn monitoring_switches_persist_and_default_to_codex_only() {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-meter-monitoring-{}-{:?}",
+            std::process::id(),
+            Instant::now()
+        ));
+        let hub = UsageHub::new();
+        hub.load_preferences(Some(directory.clone()));
+        assert_eq!(
+            hub.monitoring(),
+            Monitoring {
+                codex: true,
+                claude: false
+            }
+        );
+        hub.set_enabled(Source::Claude, true).unwrap();
+        hub.set_enabled(Source::Codex, false).unwrap();
+
+        let reloaded = UsageHub::new();
+        reloaded.load_preferences(Some(directory.clone()));
+        assert_eq!(
+            reloaded.monitoring(),
+            Monitoring {
+                codex: false,
+                claude: true
+            }
+        );
+        let (tokens, _) = reloaded.read_local();
+        assert!(
+            tokens.is_none(),
+            "Codex token stats are skipped while Codex is off"
+        );
+        let _ = fs::remove_dir_all(&directory);
     }
 
     #[test]

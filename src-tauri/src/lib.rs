@@ -2,11 +2,6 @@ mod claude_usage;
 mod codex;
 #[cfg(target_os = "macos")]
 mod macos_tray;
-mod passport;
-use passport::{
-    passport_configure, passport_enrollment, passport_pairing, passport_status, passport_toggle,
-    PassportState,
-};
 mod scheduler;
 mod token_usage;
 
@@ -106,6 +101,9 @@ async fn refresh_usage(
     state: State<'_, AppState>,
 ) -> Result<UsageSnapshot, String> {
     let hub = Arc::clone(&state.0);
+    if !hub.is_enabled(scheduler::Source::Codex) {
+        return Err("Codex 额度监测已关闭".into());
+    }
     let snapshot = match tauri::async_runtime::spawn_blocking(move || {
         let snapshot = hub.refresh_codex();
         let succeeded =
@@ -119,6 +117,27 @@ async fn refresh_usage(
         Err(_) => UsageSnapshot::service_error("Usage refresh task stopped unexpectedly"),
     };
     Ok(snapshot)
+}
+
+#[tauri::command]
+fn monitoring_status(state: State<'_, AppState>) -> scheduler::Monitoring {
+    state.0.monitoring()
+}
+
+/// Turns Codex or Claude monitoring on or off; the choice survives restarts.
+#[tauri::command]
+fn set_monitoring(
+    state: State<'_, AppState>,
+    source: String,
+    enabled: bool,
+) -> Result<scheduler::Monitoring, String> {
+    let source = match source.as_str() {
+        "codex" => scheduler::Source::Codex,
+        "claude" => scheduler::Source::Claude,
+        _ => return Err("Unknown usage source".into()),
+    };
+    state.0.set_enabled(source, enabled)?;
+    Ok(state.0.monitoring())
 }
 
 /// Updates the local timezone and asks the background worker to refresh now.
@@ -690,7 +709,6 @@ pub fn run() {
             None,
         ))
         .manage(AppState(UsageHub::new()))
-        .manage(PassportState::default())
         .manage(TrayAnchorState(Mutex::new(None)))
         .manage(PanelFocusState::default())
         .manage(GlassState::default())
@@ -701,7 +719,9 @@ pub fn run() {
                     .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
                 macos_tray::disable_app_nap();
             }
-            app.state::<AppState>().0.start(app.handle().clone());
+            let hub = &app.state::<AppState>().0;
+            hub.load_preferences(app.path().app_config_dir().ok());
+            hub.start(app.handle().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
@@ -740,8 +760,7 @@ pub fn run() {
             let show = MenuItem::with_id(app, "show", "显示用量", true, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "刷新", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-            let settings =
-                MenuItem::with_id(app, "settings", "设置 / Passport", true, None::<&str>)?;
+            let settings = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show, &refresh, &settings, &quit])?;
 
             let tray = TrayIconBuilder::with_id("usage")
@@ -808,11 +827,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
-            passport_status,
-            passport_pairing,
-            passport_enrollment,
-            passport_configure,
-            passport_toggle,
+            monitoring_status,
+            set_monitoring,
             request_usage_refresh,
             runtime_platform,
             native_glass,
@@ -829,11 +845,6 @@ pub fn run() {
         #[cfg(target_os = "macos")]
         if matches!(event, RunEvent::Reopen { .. }) {
             let _ = show_main_window(app);
-        }
-        if matches!(event, RunEvent::Exit) {
-            if let Ok(mut bridge) = app.state::<PassportState>().0.lock() {
-                let _ = bridge.stop();
-            }
         }
         if let RunEvent::WindowEvent { label, event, .. } = event {
             if label == "main" {

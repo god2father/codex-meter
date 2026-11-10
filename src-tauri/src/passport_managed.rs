@@ -418,7 +418,10 @@ mod tests {
         let mut initial = environment(&first.environment_file).unwrap();
         initial.insert("PASSPORT_METER_ADDRESSES".into(), "192.0.2.1".into());
         initial.insert("PASSPORT_ASR_URL".into(), "wss://asr.example.test/".into());
-        initial.insert("PASSPORT_ASR_TOKEN".into(), "test-token-for-rebinding-only".into());
+        initial.insert(
+            "PASSPORT_ASR_TOKEN".into(),
+            "test-token-for-rebinding-only".into(),
+        );
         let before = serde_json::to_vec(&initial).unwrap();
         fs::write(&first.environment_file, &before).unwrap();
         assert!(prepare_in(&resource, &root, false).is_err());

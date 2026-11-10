@@ -1,3 +1,4 @@
+mod claude_usage;
 mod codex;
 #[cfg(target_os = "macos")]
 mod macos_tray;
@@ -6,9 +7,11 @@ use passport::{
     passport_configure, passport_enrollment, passport_pairing, passport_status, passport_toggle,
     PassportState,
 };
+mod scheduler;
 mod token_usage;
 
-use codex::{CodexService, UsageSnapshot};
+use codex::UsageSnapshot;
+use scheduler::UsageHub;
 use serde::Serialize;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -22,7 +25,7 @@ use tauri::{
 };
 use tauri_plugin_autostart::MacosLauncher;
 
-struct AppState(Arc<Mutex<CodexService>>);
+struct AppState(Arc<UsageHub>);
 
 #[derive(Clone)]
 struct TrayAnchor {
@@ -98,11 +101,17 @@ struct PanelResizeResult {
 }
 
 #[tauri::command]
-async fn refresh_usage(state: State<'_, AppState>) -> Result<UsageSnapshot, String> {
-    let service = Arc::clone(&state.0);
-    let snapshot = match tauri::async_runtime::spawn_blocking(move || match service.lock() {
-        Ok(mut service) => service.refresh(),
-        Err(_) => UsageSnapshot::service_error("Usage service is unavailable"),
+async fn refresh_usage(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<UsageSnapshot, String> {
+    let hub = Arc::clone(&state.0);
+    let snapshot = match tauri::async_runtime::spawn_blocking(move || {
+        let snapshot = hub.refresh_codex();
+        let succeeded =
+            snapshot.error.is_none() && matches!(snapshot.status.as_str(), "ok" | "limit_reached");
+        hub.codex_refreshed(scheduler::panel_visible(&app), succeeded);
+        snapshot
     })
     .await
     {
@@ -112,14 +121,16 @@ async fn refresh_usage(state: State<'_, AppState>) -> Result<UsageSnapshot, Stri
     Ok(snapshot)
 }
 
+/// Updates the local timezone and asks the background worker to refresh now.
 #[tauri::command]
-async fn read_token_usage(
-    day_start_iso: String,
-    day_start_unix: u64,
-) -> Result<token_usage::TokenUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(move || token_usage::read(&day_start_iso, day_start_unix))
-        .await
-        .map_err(|_| "Token 用量读取任务意外停止".to_owned())?
+fn request_usage_refresh(
+    state: State<'_, AppState>,
+    timezone_offset_minutes: i64,
+    include_quota: bool,
+) {
+    // JavaScript reports minutes *behind* UTC.
+    state.0.set_timezone(-timezone_offset_minutes * 60);
+    state.0.kick(include_quota);
 }
 
 #[tauri::command]
@@ -241,6 +252,7 @@ fn show_main_window(app: &tauri::AppHandle) -> Result<(), String> {
     app.state::<PanelFocusState>()
         .0
         .store(window.is_focused().unwrap_or(false), Ordering::Relaxed);
+    app.state::<AppState>().0.panel_shown();
     #[cfg(target_os = "macos")]
     app.show().map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
@@ -677,15 +689,19 @@ pub fn run() {
             MacosLauncher::LaunchAgent,
             None,
         ))
-        .manage(AppState(Arc::new(Mutex::new(CodexService::new()))))
+        .manage(AppState(UsageHub::new()))
         .manage(PassportState::default())
         .manage(TrayAnchorState(Mutex::new(None)))
         .manage(PanelFocusState::default())
         .manage(GlassState::default())
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            app.handle()
-                .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+            {
+                app.handle()
+                    .set_activation_policy(tauri::ActivationPolicy::Accessory)?;
+                macos_tray::disable_app_nap();
+            }
+            app.state::<AppState>().0.start(app.handle().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
@@ -744,7 +760,7 @@ pub fn run() {
                         toggle_main_window(app, anchor);
                     }
                     "refresh" => {
-                        let _ = app.emit("usage://refresh-requested", ());
+                        app.state::<AppState>().0.kick(true);
                     }
                     "settings" => {
                         let _ = open_settings(app.clone());
@@ -797,7 +813,7 @@ pub fn run() {
             passport_enrollment,
             passport_configure,
             passport_toggle,
-            read_token_usage,
+            request_usage_refresh,
             runtime_platform,
             native_glass,
             update_tray_icon,

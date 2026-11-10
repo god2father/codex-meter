@@ -25,7 +25,8 @@
         "skipTaskbar": true,
         "devtools": false,
         "visible": false,
-        "shadow": false
+        "shadow": false,
+        "backgroundThrottling": "disabled"
       }
     ],
     "security": {

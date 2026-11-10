@@ -2,7 +2,7 @@ use objc2::{
     define_class, msg_send, rc::Retained, runtime::AnyObject, sel, DefinedClass, MainThreadOnly,
 };
 use objc2_app_kit::{NSApplication, NSEventMask, NSEventType, NSMenu, NSStatusItem};
-use objc2_foundation::{MainThreadMarker, NSObject};
+use objc2_foundation::{MainThreadMarker, NSActivityOptions, NSObject, NSProcessInfo, NSString};
 use std::cell::RefCell;
 use tauri::{tray::TrayIcon, Manager, PhysicalPosition};
 
@@ -46,6 +46,22 @@ define_class!(
     }
 );
 thread_local! { static TARGET: RefCell<Option<Retained<MeterStatusTarget>>> = const { RefCell::new(None) }; }
+
+/// A menu bar app with no visible window is a prime App Nap candidate, which defers its
+/// timers for minutes. Keep the process awake enough to refresh the tray; idle system
+/// sleep is still allowed.
+pub fn disable_app_nap() {
+    let options = NSActivityOptions::UserInitiatedAllowingIdleSystemSleep.difference(
+        NSActivityOptions::SuddenTerminationDisabled
+            | NSActivityOptions::AutomaticTerminationDisabled,
+    );
+    let activity = NSProcessInfo::processInfo().beginActivityWithOptions_reason(
+        options,
+        &NSString::from_str("Codex Meter refreshes tray usage"),
+    );
+    // Held for the lifetime of the process.
+    std::mem::forget(activity);
+}
 
 pub fn install(tray: &TrayIcon) -> Result<(), String> {
     let app = tray.app_handle().clone();

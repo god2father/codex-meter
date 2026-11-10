@@ -401,10 +401,13 @@ async function initializeRuntimePlatform(): Promise<void> {
   try {
     const platform = await invoke<string>("runtime_platform");
     runtimePlatform = platform === "windows" || platform === "macos" ? platform : "other";
+    trayPlatformReady = true;
     document.documentElement.dataset.nativeGlass = (await invoke<boolean>("native_glass")) ? "liquid" : "legacy";
   } catch {
     runtimePlatform = "windows";
+    trayPlatformReady = true;
   }
+  void updateTrayIcon(snapshot);
 }
 
 async function setAutostart(enabled: boolean): Promise<void> {
@@ -859,73 +862,65 @@ function claudeTooltip(): string {
   return `\nClaude · ${block}`;
 }
 
-interface TrayPresentation {
-  mood: CatMood;
+interface TrayRing {
   remaining: number;
   color: string;
+}
+
+interface TrayPresentation {
+  mood: CatMood;
+  /** Outer ring is the 5-hour window, inner ring the weekly one; missing windows draw no ring. */
+  rings: TrayRing[];
+  dimmed: boolean;
   alertDot: boolean;
+  /** Native menu bar text on macOS; empty hides it. */
   title: string;
   tooltip: string;
 }
 
+const TRAY_IDLE_COLOR = "#7890aa";
+const WEEKLY_TITLE_BELOW = 30;
+
+/** Short label used in the menu bar when a non-5-hour window is the binding one. */
+function shortWindow(minutes: number): string {
+  if (minutes === 10080) return "周";
+  if (minutes % 1440 === 0) return `${minutes / 1440}天`;
+  if (minutes % 60 === 0) return `${minutes / 60}时`;
+  return `${minutes}分`;
+}
+
 function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
   if (!monitoring.codex) {
-    return { mood: "sleeping", remaining: 0, color: "#7890aa", alertDot: false, title: "—", tooltip: "Codex 额度监测已关闭" };
+    return { mood: "sleeping", rings: [], dimmed: true, alertDot: false, title: "", tooltip: "Codex 额度监测已关闭" };
   }
-  const tightest = data ? tightestWindow(data) : null;
+  const windows = [data?.primary, data?.secondary].filter(Boolean) as LimitWindow[];
   const freshness = dataFreshness();
-  if (!data || !tightest) {
+  if (!data || !windows.length) {
     const unavailable = freshness === "unavailable";
     return {
-      mood: "neutral",
-      remaining: unavailable ? 0 : 28,
-      color: "#7890aa",
-      alertDot: unavailable,
+      mood: "neutral", rings: [], dimmed: true, alertDot: unavailable,
       title: unavailable ? "—" : "…",
       tooltip: unavailable ? "Codex 暂时无法获取用量" : "Codex 正在获取用量",
     };
   }
 
-  const remaining = remainingOf(tightest);
+  const rings = windows.map(item => ({ remaining: remainingOf(item), color: usageColor(remainingOf(item)) }));
+  const tightest = tightestWindow(data)!;
+  const lowest = remainingOf(tightest);
+  // The 5-hour number is the one that moves. Name another window only once it is both the
+  // tighter one and actually running low; the inner ring already shows it otherwise.
+  const binding = windows.length > 1 && tightest !== windows[0] && lowest < remainingOf(windows[0]) && lowest < WEEKLY_TITLE_BELOW;
+  const title = binding ? `${shortWindow(tightest.windowDurationMins)} ${lowest}%` : `${remainingOf(windows[0])}%`;
+  const detail = windows.map(item => `${formatWindow(item.windowDurationMins)} ${remainingOf(item)}%`).join(" · ");
+
   if (freshness === "expired") {
-    return {
-      mood: "sleeping",
-      remaining,
-      color: "#f2ae42",
-      alertDot: true,
-      title: `${remaining}%`,
-      tooltip: `Codex 数据已过期 · 剩余 ${remaining}%`,
-    };
+    return { mood: "sleeping", rings, dimmed: true, alertDot: true, title, tooltip: `Codex 数据已过期 · ${detail}` };
   }
-
-  const exhausted = remaining === 0 && data.status === "limit_reached";
-  const mood: CatMood = exhausted
+  const mood: CatMood = lowest === 0 && data.status === "limit_reached"
     ? "exhausted"
-    : remaining >= 50
-      ? "healthy"
-      : remaining >= 20
-        ? "warning"
-        : "critical";
-  const prefix = freshness === "reconnecting" ? "Codex 正在重连" : "Codex";
-  return {
-    mood,
-    remaining,
-    color: usageColor(remaining),
-    alertDot: false,
-    title: `${remaining}%`,
-    tooltip: `${prefix} · 剩余 ${remaining}%`,
-  };
-}
-
-function roundedRectPath(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, radius: number): void {
-  const r = Math.min(radius, width / 2, height / 2);
-  context.beginPath();
-  context.moveTo(x + r, y);
-  context.arcTo(x + width, y, x + width, y + height, r);
-  context.arcTo(x + width, y + height, x, y + height, r);
-  context.arcTo(x, y + height, x, y, r);
-  context.arcTo(x, y, x + width, y, r);
-  context.closePath();
+    : lowest >= 50 ? "healthy" : lowest >= 20 ? "warning" : "critical";
+  const prefix = freshness === "reconnecting" ? "Codex 正在重连" : "Codex 剩余";
+  return { mood, rings, dimmed: false, alertDot: false, title, tooltip: `${prefix} · ${detail}` };
 }
 
 function drawCatFace(context: CanvasRenderingContext2D, mood: CatMood): void {
@@ -1067,125 +1062,94 @@ function drawCatFace(context: CanvasRenderingContext2D, mood: CatMood): void {
   context.stroke();
 }
 
-function statusCatImage(mood: CatMood): string {
-  const canvas = document.createElement("canvas");
-  canvas.width = 64;
-  canvas.height = 64;
-  const context = canvas.getContext("2d");
-  if (!context) return "";
-  context.translate(-6, 6);
-  context.scale(1.25, 1.25);
-  drawCatFace(context, mood);
-  return canvas.toDataURL("image/png");
-}
+/** Tray artwork is drawn in a 64-unit square and scaled to the platform's pixel size. */
+const TRAY_PIXELS = { macos: 44, windows: 64 } as const;
 
-function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPresentation): void {
+function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPresentation, pixels: number): void {
   const darkMode = themeQuery.matches;
   const isMacOS = runtimePlatform === "macos";
-  const canvasWidth = isMacOS ? 104 : 64;
-  const canvasHeight = isMacOS ? 48 : 64;
-  context.clearRect(0, 0, canvasWidth, canvasHeight);
+  context.clearRect(0, 0, pixels, pixels);
+  context.save();
+  context.scale(pixels / 64, pixels / 64);
 
   if (!isMacOS) {
-    const glass = context.createLinearGradient(4, 1, 60, 63);
-    glass.addColorStop(0, darkMode ? "rgba(31, 61, 81, .98)" : "rgba(36, 74, 96, .97)");
-    glass.addColorStop(.52, darkMode ? "rgba(5, 17, 30, .99)" : "rgba(9, 28, 43, .99)");
-    glass.addColorStop(1, darkMode ? "rgba(18, 39, 57, .98)" : "rgba(20, 47, 65, .98)");
-    roundedRectPath(context, 1, 1, 62, 62, 15);
+    // Taskbars can be light or dark; a glass disc keeps the rings legible on both.
+    const glass = context.createLinearGradient(6, 2, 58, 62);
+    glass.addColorStop(0, darkMode ? "rgba(31, 61, 81, .96)" : "rgba(36, 74, 96, .95)");
+    glass.addColorStop(1, darkMode ? "rgba(5, 17, 30, .98)" : "rgba(9, 28, 43, .97)");
+    context.beginPath();
+    context.arc(32, 32, 31.5, 0, Math.PI * 2);
     context.fillStyle = glass;
     context.fill();
-    context.strokeStyle = darkMode ? "rgba(220, 245, 250, .68)" : "rgba(200, 239, 246, .82)";
-    context.lineWidth = 1.4;
+  }
+
+  // Two concentric rings: outer = 5-hour window, inner = weekly window. Each fills clockwise
+  // from 12 o'clock with what remains, so a full ring means plenty left.
+  const onGlass = !isMacOS || darkMode;
+  const track = onGlass ? "rgba(231, 248, 255, .2)" : "rgba(10, 31, 47, .16)";
+  const radii: Array<[number, number]> = [[28.5, 5], [21.5, 4.5]];
+  radii.forEach(([radius, width], index) => {
+    const ring = presentation.rings[index];
+    context.lineWidth = width;
+    context.lineCap = "round";
+    context.beginPath();
+    context.arc(32, 32, radius, 0, Math.PI * 2);
+    context.strokeStyle = track;
     context.stroke();
+    if (!ring || ring.remaining <= 0) return;
+    context.beginPath();
+    const start = -Math.PI / 2;
+    context.arc(32, 32, radius, start, start + Math.PI * 2 * Math.min(1, ring.remaining / 100));
+    context.strokeStyle = presentation.dimmed ? TRAY_IDLE_COLOR : ring.color;
+    context.stroke();
+  });
 
-    const glassShine = context.createLinearGradient(8, 3, 35, 41);
-    glassShine.addColorStop(0, "rgba(255, 255, 255, .5)");
-    glassShine.addColorStop(.45, "rgba(255, 255, 255, .09)");
-    glassShine.addColorStop(1, "rgba(255, 255, 255, 0)");
-    roundedRectPath(context, 3, 3, 58, 58, 12);
-    context.fillStyle = glassShine;
-    context.fill();
-  }
-
+  // The cat avatar sits inside the inner ring.
   context.save();
-  if (isMacOS) {
-    context.translate(-1, 2);
-    context.scale(.92, .92);
-  } else {
-    context.translate(-11, -9);
-    context.scale(1.35, 1.62);
-  }
+  context.translate(32, 33.5);
+  context.scale(.74, .74);
+  context.translate(-32, -27);
+  if (presentation.dimmed) context.globalAlpha = .72;
   drawCatFace(context, presentation.mood);
   context.restore();
 
-  if (isMacOS) {
-    context.save();
-    context.font = '600 22px -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif';
-    context.textAlign = "center";
-    context.textBaseline = "middle";
-    context.fillStyle = darkMode ? "rgba(239, 252, 255, .96)" : "rgba(13, 36, 52, .96)";
-    context.shadowColor = presentation.color;
-    context.shadowBlur = 1.5;
-    context.fillText(presentation.title, 78, 15);
-    context.restore();
-
-    roundedRectPath(context, 54, 37, 48, 9, 4.5);
-    context.fillStyle = darkMode ? "rgba(231, 248, 255, .18)" : "rgba(10, 31, 47, .18)";
-    context.fill();
-
-    const fillWidth = 44 * presentation.remaining / 100;
-    if (fillWidth > 0) {
-      roundedRectPath(context, 56, 39, Math.max(3, fillWidth), 5, 2.5);
-      const progress = context.createLinearGradient(56, 41.5, 100, 41.5);
-      progress.addColorStop(0, presentation.color);
-      progress.addColorStop(.7, presentation.color);
-      progress.addColorStop(1, "#d7fff7");
-      context.fillStyle = progress;
-      context.fill();
-    }
-  }
-
   if (presentation.alertDot) {
-    const alertX = isMacOS ? 39 : 55;
-    const alertY = isMacOS ? 8 : 8;
-    context.save();
     context.beginPath();
-    context.arc(alertX, alertY, 4.4, 0, Math.PI * 2);
+    context.arc(53, 11, 7, 0, Math.PI * 2);
     context.fillStyle = "rgba(4, 15, 26, .9)";
     context.fill();
     context.beginPath();
-    context.arc(alertX, alertY, 3, 0, Math.PI * 2);
+    context.arc(53, 11, 5, 0, Math.PI * 2);
     context.fillStyle = "#f2ae42";
     context.fill();
-    context.strokeStyle = "rgba(255, 238, 193, .9)";
-    context.lineWidth = .8;
-    context.stroke();
-    context.restore();
   }
+  context.restore();
 }
 
+let trayPlatformReady = !isTauri;
+
 async function updateTrayIcon(data: UsageSnapshot | null): Promise<void> {
-  if (!isTauri) return;
-  const width = runtimePlatform === "macos" ? 104 : 64;
-  const height = runtimePlatform === "macos" ? 48 : 64;
-  const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const context = canvas.getContext("2d");
-  if (!context) return;
+  // Until the platform is known the artwork would use the wrong size and layout.
+  if (!isTauri || !trayPlatformReady) return;
+  const pixels = runtimePlatform === "macos" ? TRAY_PIXELS.macos : TRAY_PIXELS.windows;
   const presentation = trayPresentation(data);
   const tooltip = presentation.tooltip + claudeTooltip();
   // Background events arrive every few seconds; skip the IPC when nothing visible changed.
   const trayKey = JSON.stringify([presentation, tooltip, themeQuery.matches, runtimePlatform]);
   if (trayKey === lastTrayKey) return;
-  drawTrayArtwork(context, presentation);
-  const rgba = Array.from(context.getImageData(0, 0, width, height).data);
+  const canvas = document.createElement("canvas");
+  canvas.width = pixels;
+  canvas.height = pixels;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+  drawTrayArtwork(context, presentation, pixels);
+  const rgba = Array.from(context.getImageData(0, 0, pixels, pixels).data);
   try {
     await invoke("update_tray_icon", {
       rgba,
-      width,
-      height,
-      title: runtimePlatform === "macos" ? "" : null,
+      width: pixels,
+      height: pixels,
+      title: runtimePlatform === "macos" ? presentation.title : null,
       tooltip,
     });
     lastTrayKey = trayKey;

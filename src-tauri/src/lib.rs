@@ -406,21 +406,11 @@ fn neutral_icon_windows() -> Image<'static> {
 
 #[cfg(target_os = "macos")]
 fn neutral_icon_macos() -> Image<'static> {
-    let width = 104usize;
-    let height = 48usize;
-    let mut rgba = vec![0u8; width * height * 4];
-    paint_neutral_cat(&mut rgba, width, 24, 27, 18, 14);
-    for y in 37..46 {
-        for x in 54..102 {
-            if inside_rounded_rect(x, y, 54, 37, 48, 9, 4) {
-                set_pixel(&mut rgba, width, x, y, [37, 57, 72, 110]);
-            }
-            if inside_rounded_rect(x, y, 56, 39, 13, 5, 2) {
-                set_pixel(&mut rgba, width, x, y, [112, 143, 168, 255]);
-            }
-        }
-    }
-    Image::new_owned(rgba, width as u32, height as u32)
+    // Placeholder until the webview draws the ringed cat (22pt square at 2x).
+    let size = 44usize;
+    let mut rgba = vec![0u8; size * size * 4];
+    paint_neutral_cat(&mut rgba, size, 22, 25, 15, 11);
+    Image::new_owned(rgba, size as u32, size as u32)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -665,6 +655,7 @@ fn inside_triangle(x: usize, y: usize, a: (i32, i32), b: (i32, i32), c: (i32, i3
     !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn inside_rounded_rect(
     x: usize,
     y: usize,

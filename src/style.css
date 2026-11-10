@@ -262,3 +262,11 @@ html[data-native-glass="liquid"] .brand-subtitle { color: #fff; }
 .source-switch input:checked + .switch i { transform: translateX(14px); }
 .monitor-off .token-note { margin-top: 6px; }
 .monitor-off .token-card-head strong { color: var(--muted); }
+
+/* Claude subscription windows inside the Claude card. */
+.claude-quota { margin: 8px 0 10px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.claude-quota .section-caption { margin-bottom: 2px; }
+.claude-quota .token-note { margin-top: 4px; }
+.claude-quota--off { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
+.claude-quota--off small { display: block; margin-top: 2px; font-size: 11px; color: var(--subtle); }
+.claude-quota-hint { color: var(--warning); }

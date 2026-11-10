@@ -13,8 +13,20 @@ type DataFreshness = "fresh" | "reconnecting" | "expired" | "loading" | "unavail
 type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "neutral";
 type RuntimePlatform = "windows" | "macos" | "other";
 
-type UsageSource = "codex" | "claude";
-interface Monitoring { codex: boolean; claude: boolean }
+type UsageSource = "codex" | "claude" | "claudeQuota";
+interface Monitoring { codex: boolean; claude: boolean; claudeQuota: boolean }
+
+interface ClaudeQuotaWindow { usedPercent: number; remainingPercent: number; resetsAt: number | null }
+interface ClaudeQuotaSnapshot {
+  status: "ok" | "no_credentials" | "expired" | "unauthorized" | "rate_limited" | "error";
+  plan: string | null;
+  fiveHour: ClaudeQuotaWindow | null;
+  sevenDay: ClaudeQuotaWindow | null;
+  sevenDayOpus: ClaudeQuotaWindow | null;
+  sevenDaySonnet: ClaudeQuotaWindow | null;
+  fetchedAt: number;
+  message: string | null;
+}
 
 function escapeHtml(value: string): string {
   return value.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
@@ -176,9 +188,15 @@ let tokenLoading = isTauri;
 let tokenError = "";
 let tokenDetailsOpen = false;
 let claudeSnapshot: ClaudeUsageSnapshot | null = isTauri ? null : mockClaudeSnapshot;
+let claudeQuota: ClaudeQuotaSnapshot | null = isTauri ? null : {
+  status: "ok", plan: "max", fetchedAt: Math.floor(Date.now() / 1000), message: null, sevenDaySonnet: null,
+  fiveHour: { usedPercent: 38, remainingPercent: 62, resetsAt: Math.floor(Date.now() / 1000) + 3 * 3600 },
+  sevenDay: { usedPercent: 81, remainingPercent: 19, resetsAt: Math.floor(Date.now() / 1000) + 2.5 * 86400 },
+  sevenDayOpus: { usedPercent: 44, remainingPercent: 56, resetsAt: Math.floor(Date.now() / 1000) + 2.5 * 86400 },
+};
 let claudeDetailsOpen = false;
 // Matches the backend default until monitoring_status answers; the browser preview shows both.
-let monitoring: Monitoring = isTauri ? { codex: true, claude: false } : { codex: true, claude: true };
+let monitoring: Monitoring = isTauri ? { codex: true, claude: false, claudeQuota: false } : { codex: true, claude: true, claudeQuota: true };
 let monitoringBusy: UsageSource | null = null;
 let monitoringError = "";
 let lastView = "";
@@ -215,6 +233,7 @@ function formatPlan(plan: string): string {
     go: "Go",
     plus: "Plus",
     pro: "Pro",
+    max: "Max",
     team: "Team",
     business: "Business",
     enterprise: "Enterprise",
@@ -454,7 +473,7 @@ function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" |
   return `<svg aria-hidden="true" viewBox="0 0 24 24">${paths[name]}</svg>`;
 }
 
-const SOURCE_LABEL: Record<UsageSource, string> = { codex: "Codex 额度监测", claude: "Claude 用量监测" };
+const SOURCE_LABEL: Record<UsageSource, string> = { codex: "Codex 额度监测", claude: "Claude 用量监测", claudeQuota: "Claude 订阅额度" };
 
 function sourceSwitch(source: UsageSource): string {
   const busy = monitoringBusy === source;
@@ -501,7 +520,13 @@ function renderSettings(): string {
     <p class="setting-note">外观跟随系统。Codex 额度在后台每分钟刷新，面板打开时每 30 秒；Token 统计每 10–30 秒。</p>
     <div class="section-caption settings-caption"><span>监测</span></div>
     <div class="settings-group">
-      ${(["codex", "claude"] as UsageSource[]).map(source => `<label class="setting-row setting-toggle"><span class="setting-label"><i>${icon(source === "codex" ? "app" : "spark")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${source === "codex" ? "订阅额度与本机 Codex Token" : "本机 ~/.claude 记录中的 Token"}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] ? "checked" : ""} ${monitoringBusy === source ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`).join("")}
+      ${(["codex", "claude", "claudeQuota"] as UsageSource[]).map(source => {
+        const blocked = source === "claudeQuota" && !monitoring.claude;
+        const hint = source === "codex" ? "订阅额度与本机 Codex Token"
+          : source === "claude" ? "本机 ~/.claude 记录中的 Token"
+          : blocked ? "需先开启 Claude 用量监测" : "用 Claude Code 的登录查询 5 小时与每周额度";
+        return `<label class="setting-row setting-toggle"><span class="setting-label"><i>${icon(source === "codex" ? "app" : source === "claude" ? "spark" : "clock")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${hint}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] && !blocked ? "checked" : ""} ${monitoringBusy === source || blocked ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
+      }).join("")}
     </div>
     ${monitoringError ? `<p class="inline-error" role="alert">${escapeHtml(monitoringError)}</p>` : ""}
     <p class="settings-footnote">关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
@@ -586,6 +611,46 @@ function formatClaudeReset(unixSeconds: number): string {
   return minutes >= 60 ? `${time} 重置 · 剩 ${Math.floor(minutes / 60)} 时 ${minutes % 60} 分` : `${time} 重置 · 剩 ${minutes} 分`;
 }
 
+const CLAUDE_QUOTA_HINT: Record<ClaudeQuotaSnapshot["status"], string> = {
+  ok: "",
+  no_credentials: "未找到 Claude Code 登录。在终端安装并登录 claude 命令行后会自动读取。",
+  expired: "Claude Code 登录已过期。在终端运行一次 claude 即可自动续期。",
+  unauthorized: "Claude Code 登录已失效，请在终端重新登录 claude。",
+  rate_limited: "查询过于频繁，稍后自动重试。",
+  error: "暂时无法获取 Claude 订阅额度。",
+};
+
+function quotaWindowCell(label: string, item: ClaudeQuotaWindow): string {
+  const value = clampPercent(item.remainingPercent);
+  return `<div class="quota-window" data-tone="${usageTone(value)}">
+    <div class="quota-heading"><span>${label}</span><strong>${value}<small>%</small></strong></div>
+    <div class="quota-track" role="meter" aria-label="Claude ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
+    <span class="reset-time">${formatReset(item.resetsAt)}</span>
+  </div>`;
+}
+
+/** Subscription windows on top of the Claude card; local token stats follow below. */
+function renderClaudeQuota(): string {
+  if (!monitoring.claudeQuota) {
+    return `<div class="claude-quota claude-quota--off"><span>订阅额度 <small>用 Claude Code 的登录查询 5 小时与每周额度</small></span>${sourceSwitch("claudeQuota")}</div>`;
+  }
+  const data = claudeQuota;
+  const windows: Array<[string, ClaudeQuotaWindow | null]> = [["5 小时", data?.fiveHour ?? null], ["每周", data?.sevenDay ?? null]];
+  const shown = windows.filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]));
+  const extra = [["Opus 每周", data?.sevenDayOpus], ["Sonnet 每周", data?.sevenDaySonnet]]
+    .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]))
+    .map(([label, item]) => `${label}剩余 ${clampPercent(item.remainingPercent)}%`).join(" · ");
+  const head = `<div class="section-caption"><span>订阅额度</span><span class="caption-end"><span>${data?.plan ? escapeHtml(formatPlan(data.plan)) : ""}</span>${sourceSwitch("claudeQuota")}</span></div>`;
+  if (!data) return `<div class="claude-quota">${head}<p class="token-note">正在查询 Claude 订阅额度…</p></div>`;
+  if (data.status !== "ok" || !shown.length) {
+    return `<div class="claude-quota">${head}<p class="token-note claude-quota-hint">${escapeHtml(CLAUDE_QUOTA_HINT[data.status] || data.message || "")}</p></div>`;
+  }
+  return `<div class="claude-quota">${head}
+    <div class="quota-grid">${shown.map(([label, item]) => quotaWindowCell(label, item)).join("")}</div>
+    ${extra ? `<p class="token-note">${extra}</p>` : ""}
+  </div>`;
+}
+
 function renderClaudeUsage(): string {
   const data = claudeSnapshot;
   if (!monitoring.claude) return renderMonitorOff("claude");
@@ -617,6 +682,7 @@ function renderClaudeUsage(): string {
           ${claudeDetailsOpen ? "收起" : "明细"}${icon("chevron")}
         </button>${sourceSwitch("claude")}</span>
       </div>
+      ${renderClaudeQuota()}
       <div class="token-summary-grid" role="group" aria-label="Claude 用量摘要（输入加输出）">
         ${tokenStat("5 小时窗口", io(block), available && Boolean(block), Boolean(block))}
         ${tokenStat("今日累计", io(today), available)}
@@ -797,7 +863,8 @@ async function setMonitoring(source: UsageSource, enabled: boolean): Promise<voi
       loading = !hasUsage(snapshot);
       tokenLoading = !tokenSnapshot;
     }
-    if (source === "claude" && !enabled) claudeSnapshot = null;
+    if (source === "claude" && !enabled) { claudeSnapshot = null; claudeQuota = null; }
+    if (source === "claudeQuota" && !enabled) claudeQuota = null;
     if (source === "codex" && !enabled) errorMessage = "";
   } catch (error) {
     monitoringError = error instanceof Error ? error.message : String(error);
@@ -855,11 +922,18 @@ function applyCodexSnapshot(next: UsageSnapshot): void {
 }
 
 function claudeTooltip(): string {
+  if (!monitoring.claude) return "";
+  const quota = monitoring.claudeQuota && claudeQuota?.status === "ok" ? claudeQuota : null;
+  if (quota && (quota.fiveHour || quota.sevenDay)) {
+    const parts = ([["5 小时", quota.fiveHour], ["每周", quota.sevenDay]] as Array<[string, ClaudeQuotaWindow | null]>)
+      .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]))
+      .map(([label, item]) => `${label} ${clampPercent(item.remainingPercent)}%`);
+    return `\nClaude 剩余 · ${parts.join(" · ")}`;
+  }
   const data = claudeSnapshot;
-  if (!monitoring.claude || !data?.sourceAvailable) return "";
+  if (!data?.sourceAvailable) return "";
   const value = data.currentBlock ?? data.today;
-  const block = `${data.currentBlock ? "5 小时" : "今日"} ${formatTokenSummary(value.inputTokens + value.outputTokens)}`;
-  return `\nClaude · ${block}`;
+  return `\nClaude · ${data.currentBlock ? "5 小时" : "今日"} ${formatTokenSummary(value.inputTokens + value.outputTokens)}`;
 }
 
 interface TrayRing {
@@ -1235,6 +1309,12 @@ if (isTauri) {
     tokenError = payload;
     tokenLoading = false;
     render();
+  });
+  void listen<ClaudeQuotaSnapshot>("usage://claude-quota", ({ payload }) => {
+    if (!monitoring.claudeQuota || !monitoring.claude) return;
+    claudeQuota = payload;
+    render();
+    void updateTrayIcon(snapshot);
   });
   void listen<ClaudeUsageSnapshot>("usage://claude", ({ payload }) => {
     if (!monitoring.claude) return;

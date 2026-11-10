@@ -4,6 +4,7 @@
 //! snapshots to the webview as events.
 
 use crate::{
+    claude_quota::{ClaudeQuotaService, ClaudeQuotaSnapshot},
     claude_usage::{self, ClaudeUsageService},
     codex::{CodexService, UsageSnapshot},
     token_usage,
@@ -38,6 +39,13 @@ pub const LOCAL_TOKENS: Cadence = Cadence {
     hidden: Duration::from_secs(30),
     retry: Duration::from_secs(30),
 };
+/// Claude's usage endpoint is undocumented and shared with Claude Code; poll it gently.
+pub const CLAUDE_QUOTA: Cadence = Cadence {
+    visible: Duration::from_secs(120),
+    hidden: Duration::from_secs(300),
+    retry: Duration::from_secs(300),
+};
+const CLAUDE_QUOTA_RATE_LIMITED: Duration = Duration::from_secs(600);
 /// Opening the panel refetches quota when it is older than this.
 const SHOW_STALE_AFTER: Duration = Duration::from_secs(20);
 /// Wall clock moving this far ahead of the monotonic clock means the machine slept.
@@ -58,6 +66,8 @@ impl Cadence {
 pub enum Source {
     Codex,
     Claude,
+    /// Claude subscription windows, read with Claude Code's own login. Requires `Claude`.
+    ClaudeQuota,
 }
 
 /// Which sources are monitored. Codex keeps its previous always-on behaviour by default;
@@ -67,6 +77,7 @@ pub enum Source {
 pub struct Monitoring {
     pub codex: bool,
     pub claude: bool,
+    pub claude_quota: bool,
 }
 
 impl Default for Monitoring {
@@ -74,6 +85,7 @@ impl Default for Monitoring {
         Self {
             codex: true,
             claude: false,
+            claude_quota: false,
         }
     }
 }
@@ -83,15 +95,20 @@ struct Due {
     codex: Option<Instant>,
     local: Option<Instant>,
     last_codex: Option<Instant>,
+    /// None means due now; checked on each local tick.
+    claude_quota: Option<Instant>,
+    last_claude_quota: Option<Instant>,
     wake: bool,
 }
 
 pub struct UsageHub {
     pub codex: Arc<Mutex<CodexService>>,
     claude: Mutex<ClaudeUsageService>,
+    claude_quota: Mutex<ClaudeQuotaService>,
     offset_east_seconds: AtomicI64,
     codex_enabled: AtomicBool,
     claude_enabled: AtomicBool,
+    claude_quota_enabled: AtomicBool,
     preferences_path: Mutex<Option<PathBuf>>,
     due: Mutex<Due>,
     signal: Condvar,
@@ -102,9 +119,11 @@ impl UsageHub {
         Arc::new(Self {
             codex: Arc::new(Mutex::new(CodexService::new())),
             claude: Mutex::new(ClaudeUsageService::new()),
+            claude_quota: Mutex::new(ClaudeQuotaService::new()),
             offset_east_seconds: AtomicI64::new(0),
             codex_enabled: AtomicBool::new(Monitoring::default().codex),
             claude_enabled: AtomicBool::new(Monitoring::default().claude),
+            claude_quota_enabled: AtomicBool::new(Monitoring::default().claude_quota),
             preferences_path: Mutex::new(None),
             due: Mutex::new(Due::default()),
             signal: Condvar::new(),
@@ -115,6 +134,7 @@ impl UsageHub {
         Monitoring {
             codex: self.codex_enabled.load(Ordering::Relaxed),
             claude: self.claude_enabled.load(Ordering::Relaxed),
+            claude_quota: self.claude_quota_enabled.load(Ordering::Relaxed),
         }
     }
 
@@ -122,6 +142,10 @@ impl UsageHub {
         match source {
             Source::Codex => self.codex_enabled.load(Ordering::Relaxed),
             Source::Claude => self.claude_enabled.load(Ordering::Relaxed),
+            Source::ClaudeQuota => {
+                self.claude_enabled.load(Ordering::Relaxed)
+                    && self.claude_quota_enabled.load(Ordering::Relaxed)
+            }
         }
     }
 
@@ -130,6 +154,8 @@ impl UsageHub {
             .store(monitoring.codex, Ordering::Relaxed);
         self.claude_enabled
             .store(monitoring.claude, Ordering::Relaxed);
+        self.claude_quota_enabled
+            .store(monitoring.claude_quota, Ordering::Relaxed);
     }
 
     /// Reads saved switches from `<config dir>/monitoring.json`; a missing or broken file keeps defaults.
@@ -152,6 +178,7 @@ impl UsageHub {
         match source {
             Source::Codex => next.codex = enabled,
             Source::Claude => next.claude = enabled,
+            Source::ClaudeQuota => next.claude_quota = enabled,
         }
         let path = self
             .preferences_path
@@ -173,6 +200,11 @@ impl UsageHub {
             }
         }
         if enabled {
+            if source != Source::Codex {
+                if let Ok(mut due) = self.due.lock() {
+                    due.claude_quota = None;
+                }
+            }
             self.kick(source == Source::Codex);
         }
         Ok(())
@@ -202,7 +234,13 @@ impl UsageHub {
         let stale = self
             .due
             .lock()
-            .map(|due| {
+            .map(|mut due| {
+                if due
+                    .last_claude_quota
+                    .is_none_or(|last| last.elapsed() >= CLAUDE_QUOTA.visible)
+                {
+                    due.claude_quota = None;
+                }
                 due.last_codex
                     .is_none_or(|last| last.elapsed() >= SHOW_STALE_AFTER)
             })
@@ -290,11 +328,42 @@ impl UsageHub {
                 if let Some(snapshot) = claude {
                     let _ = app.emit("usage://claude", &snapshot);
                 }
+                if let Some(snapshot) = self.claude_quota_if_due(visible) {
+                    let _ = app.emit("usage://claude-quota", &snapshot);
+                }
                 if let Ok(mut due) = self.due.lock() {
                     due.local = Some(Instant::now() + LOCAL_TOKENS.next(visible, succeeded));
                 }
             }
         }
+    }
+
+    /// Fetches the Claude subscription windows when enabled and due; the network call happens
+    /// without holding the schedule lock.
+    fn claude_quota_if_due(&self, visible: bool) -> Option<ClaudeQuotaSnapshot> {
+        if !self.is_enabled(Source::ClaudeQuota) {
+            return None;
+        }
+        let due = self
+            .due
+            .lock()
+            .map(|due| due.claude_quota.is_none_or(|at| at <= Instant::now()))
+            .unwrap_or(false);
+        if !due {
+            return None;
+        }
+        let snapshot = self.claude_quota.lock().ok()?.fetch();
+        let delay = if snapshot.status == "rate_limited" {
+            CLAUDE_QUOTA_RATE_LIMITED
+        } else {
+            CLAUDE_QUOTA.next(visible, snapshot.succeeded())
+        };
+        if let Ok(mut due) = self.due.lock() {
+            let now = Instant::now();
+            due.last_claude_quota = Some(now);
+            due.claude_quota = Some(now + delay);
+        }
+        Some(snapshot)
     }
 
     fn wait_for_work(&self, last_tick: &mut (Instant, SystemTime)) -> (bool, bool) {
@@ -395,11 +464,13 @@ mod tests {
             hub.monitoring(),
             Monitoring {
                 codex: true,
-                claude: false
+                claude: false,
+                claude_quota: false
             }
         );
         hub.set_enabled(Source::Claude, true).unwrap();
         hub.set_enabled(Source::Codex, false).unwrap();
+        hub.set_enabled(Source::ClaudeQuota, true).unwrap();
 
         let reloaded = UsageHub::new();
         reloaded.load_preferences(Some(directory.clone()));
@@ -407,7 +478,8 @@ mod tests {
             reloaded.monitoring(),
             Monitoring {
                 codex: false,
-                claude: true
+                claude: true,
+                claude_quota: true
             }
         );
         let (tokens, _) = reloaded.read_local();
@@ -415,6 +487,13 @@ mod tests {
             tokens.is_none(),
             "Codex token stats are skipped while Codex is off"
         );
+        assert!(reloaded.is_enabled(Source::ClaudeQuota));
+        reloaded.set_enabled(Source::Claude, false).unwrap();
+        assert!(
+            !reloaded.is_enabled(Source::ClaudeQuota),
+            "quota follows the Claude switch"
+        );
+        assert!(reloaded.claude_quota_if_due(false).is_none());
         let _ = fs::remove_dir_all(&directory);
     }
 

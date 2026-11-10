@@ -1,3 +1,4 @@
+mod claude_quota;
 mod claude_usage;
 mod codex;
 #[cfg(target_os = "macos")]
@@ -134,6 +135,7 @@ fn set_monitoring(
     let source = match source.as_str() {
         "codex" => scheduler::Source::Codex,
         "claude" => scheduler::Source::Claude,
+        "claudeQuota" => scheduler::Source::ClaudeQuota,
         _ => return Err("Unknown usage source".into()),
     };
     state.0.set_enabled(source, enabled)?;

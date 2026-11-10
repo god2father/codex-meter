@@ -18,7 +18,7 @@ type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "
 type RuntimePlatform = "windows" | "macos" | "other";
 
 interface PassportConfig { runtime: string; script: string; environmentFile: string }
-interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; message: string }
+interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; uncertainSubmission?: boolean; message: string }
 let passport: PassportStatus = { config: { runtime: "", script: "", environmentFile: "" }, running: false, connected: false, message: "已关闭" };
 let passportBusy = false;
 let passportReading = false;
@@ -86,6 +86,23 @@ interface TokenUsageSnapshot {
   currentSession: TokenUsagePeriod | null;
   fetchedAt: number;
   sourceAvailable: boolean;
+}
+
+interface ClaudeTokenBreakdown {
+  inputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+interface ClaudeUsageSnapshot {
+  sourceAvailable: boolean;
+  today: ClaudeTokenBreakdown;
+  currentBlock: (ClaudeTokenBreakdown & { startedAt: number; resetsAt: number; messages: number }) | null;
+  currentSession: (ClaudeTokenBreakdown & { updatedAt: number; model: string | null }) | null;
+  models: Array<{ model: string; totalTokens: number; outputTokens: number }>;
+  fetchedAt: number;
 }
 
 interface PanelPosition {
@@ -159,6 +176,21 @@ const mockTokenSnapshot: TokenUsageSnapshot = {
   sourceAvailable: true,
 };
 
+const mockClaudeSnapshot: ClaudeUsageSnapshot = {
+  sourceAvailable: true,
+  today: { inputTokens: 4_200, cacheCreationTokens: 310_000, cacheReadTokens: 2_480_000, outputTokens: 58_000, totalTokens: 2_852_200 },
+  currentBlock: {
+    inputTokens: 1_100, cacheCreationTokens: 96_000, cacheReadTokens: 820_000, outputTokens: 17_500, totalTokens: 934_600,
+    startedAt: Math.floor(Date.now() / 1000) - 2 * 3600, resetsAt: Math.floor(Date.now() / 1000) + 3 * 3600, messages: 42,
+  },
+  currentSession: {
+    inputTokens: 620, cacheCreationTokens: 48_000, cacheReadTokens: 410_000, outputTokens: 9_800, totalTokens: 468_420,
+    updatedAt: Math.floor(Date.now() / 1000) - 40, model: "claude-opus-5-5",
+  },
+  models: [{ model: "claude-opus-5-5", totalTokens: 2_400_000, outputTokens: 50_000 }, { model: "claude-haiku-5-5", totalTokens: 452_200, outputTokens: 8_000 }],
+  fetchedAt: Math.floor(Date.now() / 1000),
+};
+
 const CACHE_KEY = "codex-meter:last-usage";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -168,9 +200,10 @@ let runtimePlatform: RuntimePlatform = isTauri ? "other" : "windows";
 let loading = isTauri && !snapshot;
 let refreshing = false;
 let tokenLoading = isTauri;
-let tokenRefreshing = false;
 let tokenError = "";
 let tokenDetailsOpen = false;
+let claudeSnapshot: ClaudeUsageSnapshot | null = isTauri ? null : mockClaudeSnapshot;
+let claudeDetailsOpen = false;
 let errorMessage = "";
 let settingsOpen = false;
 let autostartEnabled = !isTauri;
@@ -182,6 +215,9 @@ let panelSyncFrame = 0;
 let panelResizeObserver: ResizeObserver | null = null;
 let lastRenderedFreshness: DataFreshness | null = null;
 let freshnessExpiryTimer = 0;
+let lastTrayKey = "";
+let exitArmed = false;
+let exitArmTimer = 0;
 
 const app = document.querySelector<HTMLElement>("#app")!;
 
@@ -243,11 +279,10 @@ function formatUpdated(unixSeconds: number): string {
 
 function formatTokenSummary(value: number): string {
   const normalized = Math.max(0, Math.round(value));
-  const scaled = normalized / 10_000;
+  if (normalized < 10_000) return new Intl.NumberFormat("zh-CN").format(normalized);
+  const [scaled, unit] = normalized >= 100_000_000 ? [normalized / 100_000_000, "亿"] : [normalized / 10_000, "万"];
   const maximumFractionDigits = scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2;
-  return `${new Intl.NumberFormat("zh-CN", {
-    maximumFractionDigits,
-  }).format(scaled)}万`;
+  return `${new Intl.NumberFormat("zh-CN", { maximumFractionDigits }).format(scaled)}${unit}`;
 }
 
 function tightestWindow(data: UsageSnapshot): LimitWindow | null {
@@ -322,11 +357,11 @@ function statusCopy(freshness = dataFreshness()): { label: string; detail: strin
     };
   }
   if (snapshot?.status === "limit_reached") return { label: "额度已用尽", detail: "等待额度窗口重置" };
-  return { label: "状态良好", detail: "实时用量已同步" };
+  return { label: "状态良好", detail: "Codex 额度已同步" };
 }
 
 function footerStatusCopy(freshness = dataFreshness()): string {
-  if (freshness === "fresh") return "实时用量已同步";
+  if (freshness === "fresh" && snapshot) return `Codex 额度 · ${formatUpdated(snapshot.fetchedAt)}`;
   if (freshness === "reconnecting" && snapshot) {
     const action = refreshing && !errorMessage ? "正在同步" : "正在重连";
     return `${action} · 显示 ${dataAgeMinutes(snapshot)} 分钟前的数据`;
@@ -411,13 +446,15 @@ async function setAutostart(enabled: boolean): Promise<void> {
   }
 }
 
-function icon(name: "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens" | "device" | "link" | "arrow" | "back" | "chevron" | "laptop"): string {
+function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens" | "device" | "link" | "arrow" | "back" | "chevron" | "laptop"): string {
   const paths = {
     device: '<rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M9 6h6M10 17h4"/>',
     link: '<path d="m10 13 4-4M8 16l-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M16 8l1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0"/>',
     arrow: '<path d="M5 12h14m-5-5 5 5-5 5"/>',
     back: '<path d="m14 6-6 6 6 6"/>',
     chevron: '<path d="m8 10 4 4 4-4"/>',
+    chevronRight: '<path d="m10 8 4 4-4 4"/>',
+    spark: '<path d="M12 3.5v17M4.6 7.75l14.8 8.5M4.6 16.25l14.8-8.5"/>',
     laptop: '<rect x="4" y="4" width="16" height="12" rx="2"/><path d="M2 20h20M9 16l-1 4m7-4 1 4"/>',
     refresh: '<path d="M20 11a8.1 8.1 0 1 0 .1 4M20 4v7h-7"/>',
     settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
@@ -456,6 +493,16 @@ function passportStateLabel(): string {
   return passport.failed ? "启动失败" : passportError ? "连接异常" : passport.connected ? "设备已连接" : passport.running ? "等待设备" : "已关闭";
 }
 
+// Delivery of the last voice/text submission is unknown; new input stays blocked until the user
+// checks the chat on this computer. Releasing never resends anything.
+function renderUncertainSubmission(): string {
+  if (!passport.uncertainSubmission) return "";
+  return `<div class="uncertain-submission" role="alert">
+    <p>上一次语音提交是否送达无法确认，新的语音输入已暂停。请先在电脑上查看该聊天：已送达就不要重发。</p>
+    <button class="text-button" data-action="passport-release" ${passportBusy ? "disabled" : ""}>已检查，解除</button>
+  </div>`;
+}
+
 function renderPassport(): string {
   const tone = passportError || passport.failed ? "error" : passport.connected ? "connected" : passport.running ? "waiting" : "offline";
   const label = passportBusy ? "正在处理" : passportStateLabel();
@@ -466,25 +513,25 @@ function renderPassport(): string {
       <label class="setting-toggle passport-switch"><input type="checkbox" data-setting="passport" aria-label="Passport 连接开关" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
       <button class="icon-button" data-action="passport-setup" title="Passport 设置" aria-label="Passport 设置">${icon("settings")}</button>
     </div>
+    ${renderUncertainSubmission()}
     ${passportError ? `<p class="inline-error" role="alert">${escapePassport(passportError)}</p>` : ""}
   </section>`;
 }
 
 function renderSettings(): string {
   return `<section id="settings-card" class="settings-content" aria-label="偏好设置">
-    <div class="section-caption"><span>通用</span><span>按你的方式工作</span></div>
+    <div class="section-caption"><span>通用</span></div>
     <div class="settings-group">
-      <div class="setting-row"><span class="setting-label"><i>${icon("moon")}</i><span>外观</span></span><span class="setting-value">跟随系统</span></div>
-      <div class="setting-row"><span class="setting-label"><i>${icon("clock")}</i><span>额度刷新</span></span><span class="setting-value">每分钟</span></div>
       <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>登录时启动</span><small>自动驻留托盘</small></span></span><input type="checkbox" data-setting="autostart" aria-label="登录时启动" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
     </div>
     ${autostartError ? `<p class="inline-error" role="alert">${escapePassport(autostartError)}</p>` : ""}
-    <div class="section-caption settings-caption"><span>Passport</span><span class="connection-pill" data-on="${passport.connected}"><i></i>${passportStateLabel()}</span></div>
+    <p class="setting-note">外观跟随系统。Codex 额度在后台每分钟刷新，面板打开时每 30 秒；Token 统计每 10–30 秒。</p>
+    <div class="section-caption settings-caption"><span>Passport</span></div>
     <div class="settings-group">
-      <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>Bridge 连接</span><small>手动开启局域网服务</small></span></span><input type="checkbox" data-setting="passport" aria-label="Bridge 连接" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
-      <button class="setting-row setting-button" data-action="passport-bind" ${passportBusy || !isTauri ? "disabled" : ""}><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>${pairingBusy ? "正在准备…" : pairingCode ? "刷新绑定码" : "绑定设备"}</span><small>手机页面输入绑定码，完成无线连接</small></span></span>${icon("chevron")}</button>
+      <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("link")}</i><span class="setting-copy"><span>Bridge 连接</span><small>${escapePassport(passportBusy ? "正在处理" : passportStateLabel())} · 手动开启局域网服务</small></span></span><input type="checkbox" data-setting="passport" aria-label="Bridge 连接" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
+      <button class="setting-row setting-button" data-action="passport-bind" ${passportBusy || !isTauri ? "disabled" : ""}><span class="setting-label"><i>${icon("device")}</i><span class="setting-copy"><span>${pairingBusy ? "正在准备…" : pairingCode ? "刷新绑定码" : "绑定设备"}</span><small>手机页面输入绑定码，完成无线连接</small></span></span>${icon("chevronRight")}</button>
     </div>
-    <p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>
+    ${passportError || (passport.message && passport.message !== passportStateLabel()) ? `<p class="setting-note" role="status">${escapePassport(passportError || passport.message)}</p>` : ""}
     ${pairingError ? `<p class="inline-error" role="alert">${escapePassport(pairingError)}</p>` : ""}
     ${pairingCode ? `<div class="pairing-code pairing-code--pin" aria-label="电脑绑定码">${escapePassport(pairingCode)}</div><p class="setting-note">手机加入 Passport 热点，在自动打开的配网页面填写此码，再选择与电脑相同的 Wi-Fi。验证通过后，在设备上确认保存。绑定码有效期 5 分钟，电脑会自动验证，无需在 Meter 上确认。</p><button class="text-button" data-action="passport-hide-code">收起绑定码</button>` : ""}
     <p class="settings-footnote">Bridge 默认关闭。配网与电脑绑定均通过手机完成，无需 USB。</p>
@@ -500,6 +547,16 @@ function renderTokenTableCell(value: number | undefined, available: boolean): st
   if (!available || value === undefined) return '<td aria-label="暂无数据">—</td>';
   const formatted = formatTokenSummary(value);
   return `<td title="${formatted}">${formatted}</td>`;
+}
+
+/** One summary figure; the visible label is hidden from screen readers and folded into the value's label. */
+function tokenStat(label: string, value: number | undefined, available: boolean, active = false): string {
+  const text = renderTokenValue(value, available);
+  const spoken = text === "—" ? "暂无数据" : text;
+  return `<div class="token-stat">
+    <span aria-hidden="true">${label}${active ? "<i></i>" : ""}</span>
+    <strong aria-label="${label}${active ? "（进行中）" : ""} ${spoken}" title="${spoken}">${text}</strong>
+  </div>`;
 }
 
 function renderTokenUsage(): string {
@@ -519,26 +576,17 @@ function renderTokenUsage(): string {
           : "仅统计本机 Token，不读取对话内容";
 
   return `
-    <section class="token-card" aria-label="Token 用量">
+    <section class="token-card" aria-label="Codex Token 用量">
       <div class="token-card-head">
-        <div><span class="token-mark">${icon("tokens")}</span><strong>Token 统计</strong></div>
+        <div><span class="token-mark">${icon("tokens")}</span><strong>Codex Token</strong></div>
         <button class="token-detail-button" data-action="token-details" aria-expanded="${tokenDetailsOpen}" aria-controls="token-details">
           ${tokenDetailsOpen ? "收起" : "明细"}${icon("chevron")}
         </button>
       </div>
-      <div class="token-summary-grid" aria-label="Token 用量摘要">
-        <div class="token-stat">
-          <span>最近一轮${recent?.active ? '<i aria-label="进行中"></i>' : ""}</span>
-          <strong title="${recent ? formatTokenSummary(recent.totalTokens) : "暂无数据"}">${renderTokenValue(recent?.totalTokens, available)}</strong>
-        </div>
-        <div class="token-stat">
-          <span>今日累计</span>
-          <strong title="${today ? formatTokenSummary(today.totalTokens) : "暂无数据"}">${renderTokenValue(today?.totalTokens, available)}</strong>
-        </div>
-        <div class="token-stat">
-          <span>当前会话</span>
-          <strong title="${session ? formatTokenSummary(session.totalTokens) : "暂无数据"}">${renderTokenValue(session?.totalTokens, available)}</strong>
-        </div>
+      <div class="token-summary-grid" role="group" aria-label="Codex Token 摘要">
+        ${tokenStat("最近一轮", recent?.totalTokens, available, Boolean(recent?.active))}
+        ${tokenStat("今日累计", today?.totalTokens, available)}
+        ${tokenStat("当前会话", session?.totalTokens, available)}
       </div>
       ${tokenDetailsOpen ? `
         <div class="token-details" id="token-details">
@@ -555,6 +603,60 @@ function renderTokenUsage(): string {
           </table>
         </div>` : ""}
       <p class="token-note${tokenError ? " token-error" : ""}" role="${tokenError ? "status" : "note"}">${stateCopy}</p>
+    </section>`;
+}
+
+function formatModel(model: string): string {
+  return model.replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, c => c.toUpperCase());
+}
+
+function formatClaudeReset(unixSeconds: number): string {
+  const minutes = Math.max(0, Math.round((unixSeconds - Date.now() / 1000) / 60));
+  const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(unixSeconds * 1000));
+  return minutes >= 60 ? `${time} 重置 · 剩 ${Math.floor(minutes / 60)} 时 ${minutes % 60} 分` : `${time} 重置 · 剩 ${minutes} 分`;
+}
+
+function renderClaudeUsage(): string {
+  const data = claudeSnapshot;
+  if (isTauri && data && !data.sourceAvailable) return "";
+  const available = Boolean(data?.sourceAvailable);
+  const block = data?.currentBlock ?? null;
+  const session = data?.currentSession ?? null;
+  const today = data?.today;
+  const blockProgress = block ? clampPercent(((Date.now() / 1000) - block.startedAt) / (block.resetsAt - block.startedAt) * 100) : 0;
+  // Cache reads dominate Claude totals (often >95%), so the headline counts input + output only.
+  const io = (value: ClaudeTokenBreakdown | null | undefined) => value ? value.inputTokens + value.outputTokens : undefined;
+  const note = !data
+    ? "正在读取本机 Claude Code 记录"
+    : block
+      ? `${formatClaudeReset(block.resetsAt)} · 不含缓存`
+      : "当前没有活跃的 5 小时窗口 · 数字不含缓存";
+  const row = (label: string, key: keyof ClaudeTokenBreakdown) =>
+    `<tr${key === "totalTokens" ? ' class="token-total-row"' : ""}><th scope="row">${label}</th>${renderTokenTableCell(block?.[key], available && Boolean(block))}${renderTokenTableCell(today?.[key], available)}${renderTokenTableCell(session?.[key], available && Boolean(session))}</tr>`;
+  return `
+    <section class="token-card claude-card" aria-label="Claude 用量">
+      <div class="token-card-head">
+        <div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div>
+        <button class="token-detail-button" data-action="claude-details" aria-expanded="${claudeDetailsOpen}" aria-controls="claude-details">
+          ${claudeDetailsOpen ? "收起" : "明细"}${icon("chevron")}
+        </button>
+      </div>
+      <div class="token-summary-grid" role="group" aria-label="Claude 用量摘要（输入加输出）">
+        ${tokenStat("5 小时窗口", io(block), available && Boolean(block), Boolean(block))}
+        ${tokenStat("今日累计", io(today), available)}
+        ${tokenStat("当前会话", io(session), available && Boolean(session))}
+      </div>
+      ${block ? `<div class="quota-track claude-window" role="progressbar" aria-label="5 小时窗口已过时间" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${blockProgress}"><i style="width:${blockProgress}%"></i></div>` : ""}
+      ${claudeDetailsOpen ? `
+        <div class="token-details" id="claude-details">
+          <table>
+            <caption>Claude Token 分类明细</caption>
+            <thead><tr><th scope="col">分类</th><th scope="col">5 小时</th><th scope="col">今日</th><th scope="col">会话</th></tr></thead>
+            <tbody>${row("输入", "inputTokens")}${row("缓存写", "cacheCreationTokens")}${row("缓存读", "cacheReadTokens")}${row("输出", "outputTokens")}${row("总计", "totalTokens")}</tbody>
+          </table>
+          ${data?.models.length ? `<p class="claude-models">今日模型 · ${data.models.map(item => `${escapePassport(formatModel(item.model))} ${formatTokenSummary(item.totalTokens)}`).join(" · ")}</p>` : ""}
+        </div>` : ""}
+      <p class="token-note" role="note">${note}</p>
     </section>`;
 }
 
@@ -577,9 +679,9 @@ function render(): void {
         <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
-        ${settingsOpen ? renderSettings() : `${renderQuota()}${renderPassport()}${renderTokenUsage()}`}
+        ${settingsOpen ? renderSettings() : `${renderQuota()}${renderTokenUsage()}${renderClaudeUsage()}${renderPassport()}`}
       </div>
-      <footer class="panel-footer"><div class="updated" role="status" title="${escapePassport(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : "alert")}<span>${escapePassport(footerStatusCopy())}</span></div><button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button></footer>
+      <footer class="panel-footer"><div class="updated" role="status" title="${escapePassport(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : "alert")}<span>${escapePassport(footerStatusCopy())}</span></div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
   </div>`;
   if (!changedView) {
@@ -661,36 +763,34 @@ function normalizeTokenSnapshot(value: unknown): TokenUsageSnapshot {
   return candidate;
 }
 
-async function refreshTokenUsage(): Promise<void> {
-  if (tokenRefreshing) return;
+function applyTokenSnapshot(value: unknown): void {
+  try {
+    tokenSnapshot = normalizeTokenSnapshot(value);
+    tokenError = "";
+  } catch (error) {
+    tokenError = error instanceof Error ? error.message : String(error);
+  }
+  tokenLoading = false;
+  render();
+}
+
+/** Asks the background scheduler for fresh local token stats (and quota when asked). */
+async function requestBackgroundRefresh(includeQuota: boolean): Promise<void> {
   if (!isTauri) {
     tokenSnapshot = { ...mockTokenSnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
+    claudeSnapshot = { ...mockClaudeSnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
     tokenError = "";
     render();
     return;
   }
-
-  tokenRefreshing = true;
-  tokenLoading = !tokenSnapshot;
-  tokenError = "";
-  try {
-    const dayStart = new Date();
-    dayStart.setHours(0, 0, 0, 0);
-    tokenSnapshot = normalizeTokenSnapshot(await invoke("read_token_usage", {
-      dayStartIso: dayStart.toISOString(),
-      dayStartUnix: Math.floor(dayStart.getTime() / 1000),
-    }));
-  } catch (error) {
-    tokenError = error instanceof Error ? error.message : String(error);
-  } finally {
-    tokenLoading = false;
-    tokenRefreshing = false;
-    render();
-  }
+  await invoke("request_usage_refresh", {
+    timezoneOffsetMinutes: new Date().getTimezoneOffset(),
+    includeQuota,
+  }).catch(() => undefined);
 }
 
 async function refreshAllUsage(): Promise<void> {
-  await Promise.all([refreshUsage(), refreshTokenUsage()]);
+  await Promise.all([refreshUsage(), requestBackgroundRefresh(false)]);
 }
 
 async function refreshUsage(): Promise<void> {
@@ -709,18 +809,7 @@ async function refreshUsage(): Promise<void> {
   render();
   void updateTrayIcon(snapshot);
   try {
-    const next = normalizeSnapshot(await invoke("refresh_usage"));
-    const successful = Boolean(tightestWindow(next)) && !next.error && (next.status === "ok" || next.status === "limit_reached");
-    if (successful) {
-      snapshot = next;
-      saveSnapshot(next);
-    } else if (hasUsage(snapshot)) {
-      errorMessage = next.error || statusCopyFor(next.status);
-      snapshot = { ...snapshot, status: "stale" };
-    } else {
-      snapshot = next;
-      errorMessage = next.error || "";
-    }
+    applyCodexSnapshot(normalizeSnapshot(await invoke("refresh_usage")));
   } catch (error) {
     errorMessage = error instanceof Error ? error.message : String(error);
     if (hasUsage(snapshot)) {
@@ -732,6 +821,29 @@ async function refreshUsage(): Promise<void> {
     render();
     await updateTrayIcon(snapshot);
   }
+}
+
+function applyCodexSnapshot(next: UsageSnapshot): void {
+  const successful = Boolean(tightestWindow(next)) && !next.error && (next.status === "ok" || next.status === "limit_reached");
+  if (successful) {
+    snapshot = next;
+    errorMessage = "";
+    saveSnapshot(next);
+  } else if (hasUsage(snapshot)) {
+    errorMessage = next.error || statusCopyFor(next.status);
+    snapshot = { ...snapshot, status: "stale" };
+  } else {
+    snapshot = next;
+    errorMessage = next.error || "";
+  }
+}
+
+function claudeTooltip(): string {
+  const data = claudeSnapshot;
+  if (!data?.sourceAvailable) return "";
+  const value = data.currentBlock ?? data.today;
+  const block = `${data.currentBlock ? "5 小时" : "今日"} ${formatTokenSummary(value.inputTokens + value.outputTokens)}`;
+  return `\nClaude · ${block}`;
 }
 
 interface TrayPresentation {
@@ -1046,6 +1158,10 @@ async function updateTrayIcon(data: UsageSnapshot | null): Promise<void> {
   const context = canvas.getContext("2d");
   if (!context) return;
   const presentation = trayPresentation(data);
+  const tooltip = presentation.tooltip + claudeTooltip();
+  // Background events arrive every few seconds; skip the IPC when nothing visible changed.
+  const trayKey = JSON.stringify([presentation, tooltip, themeQuery.matches, runtimePlatform]);
+  if (trayKey === lastTrayKey) return;
   drawTrayArtwork(context, presentation);
   const rgba = Array.from(context.getImageData(0, 0, width, height).data);
   try {
@@ -1054,8 +1170,9 @@ async function updateTrayIcon(data: UsageSnapshot | null): Promise<void> {
       width,
       height,
       title: runtimePlatform === "macos" ? "" : null,
-      tooltip: presentation.tooltip,
+      tooltip,
     });
+    lastTrayKey = trayKey;
   } catch {
     // Older backends may not expose dynamic tray icons; usage UI remains functional.
   }
@@ -1079,6 +1196,9 @@ app.addEventListener("click", async (event) => {
       await passportCommand("passport_toggle", { enabled: !passport.running });
       app.querySelector<HTMLButtonElement>('[data-action="passport-toggle"]')?.focus();
       break;
+    case "passport-release":
+      await passportCommand("passport_release_submission");
+      break;
     case "passport-bind":
       await generatePairing();
       break;
@@ -1088,6 +1208,11 @@ app.addEventListener("click", async (event) => {
       break;
     case "refresh":
       await refreshAllUsage();
+      break;
+    case "claude-details":
+      claudeDetailsOpen = !claudeDetailsOpen;
+      render();
+      app.querySelector<HTMLButtonElement>('[data-action="claude-details"]')?.focus();
       break;
     case "token-details":
       tokenDetailsOpen = !tokenDetailsOpen;
@@ -1101,6 +1226,15 @@ app.addEventListener("click", async (event) => {
 
       break;
     case "exit":
+      // Quitting removes the tray icon, so require a second click within a few seconds.
+      if (!exitArmed) {
+        exitArmed = true;
+        render();
+        app.querySelector<HTMLButtonElement>('[data-action="exit"]')?.focus();
+        window.clearTimeout(exitArmTimer);
+        exitArmTimer = window.setTimeout(() => { exitArmed = false; render(); }, 3000);
+        break;
+      }
       if (isTauri) await invoke("quit_app");
       else window.close();
       break;
@@ -1127,7 +1261,30 @@ if (isTauri) {
   document.addEventListener("keydown", (event) => {
     if (event.key === "Escape") void invoke("hide_panel").catch(() => undefined);
   });
-  void listen("usage://refresh-requested", () => void refreshAllUsage());
+  // The Rust scheduler owns the refresh cadence so updates keep flowing while the panel is hidden.
+  void listen<UsageSnapshot>("usage://codex", ({ payload }) => {
+    if (refreshing) return;
+    try {
+      applyCodexSnapshot(normalizeSnapshot(payload));
+    } catch (error) {
+      errorMessage = error instanceof Error ? error.message : String(error);
+    }
+    loading = false;
+    render();
+    void updateTrayIcon(snapshot);
+  });
+  void listen("usage://tokens", ({ payload }) => applyTokenSnapshot(payload));
+  void listen<string>("usage://tokens-error", ({ payload }) => {
+    tokenError = payload;
+    tokenLoading = false;
+    render();
+  });
+  void listen<ClaudeUsageSnapshot>("usage://claude", ({ payload }) => {
+    const hadClaude = Boolean(claudeSnapshot?.sourceAvailable);
+    claudeSnapshot = payload;
+    render();
+    if (hadClaude !== payload.sourceAvailable || payload.sourceAvailable) void updateTrayIcon(snapshot);
+  });
   void listen("settings://open", () => {
     settingsOpen = true;
     render();
@@ -1137,7 +1294,8 @@ if (isTauri) {
     applyPanelPosition();
   });
   void initializeAutostart();
-  void initializeRuntimePlatform().then(() => refreshAllUsage());
+  // The scheduler fetches quota on its first tick; only make sure local stats use our timezone.
+  void initializeRuntimePlatform().then(() => requestBackgroundRefresh(false));
 } else {
   void updateTrayIcon(mockSnapshot);
 }
@@ -1155,8 +1313,6 @@ window.setInterval(() => {
   }
 }, 30_000);
 
-window.setInterval(() => void refreshUsage(), 60_000);
-window.setInterval(() => void refreshTokenUsage(), 15_000);
 
 themeQuery.addEventListener("change", () => {
   void updateTrayIcon(snapshot);

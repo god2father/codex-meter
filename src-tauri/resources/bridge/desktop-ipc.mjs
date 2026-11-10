@@ -35,8 +35,12 @@ function requestFingerprint(owner, request, state) {
   return JSON.stringify({ owner, request, details });
 }
 
+// Copy-on-write along each patch path: the source stays untouched, but unchanged branches are
+// shared instead of deep-cloning the whole conversation for every streamed patch.
 export function patchState(state, patches) {
-  const result = structuredClone(state);
+  const copied = new WeakSet();
+  const copy = value => { const result = Array.isArray(value) ? [...value] : { ...value }; copied.add(result); return result; };
+  const result = copy(state);
   for (const patch of patches) {
     const keys = patch.path;
     if (!Array.isArray(keys) || !keys.length || keys.some(k =>
@@ -45,7 +49,9 @@ export function patchState(state, patches) {
     let parent = result;
     for (const key of keys.slice(0, -1)) {
       if (!parent || typeof parent !== 'object' || !Object.hasOwn(parent, key)) throw new Error('Missing patch parent');
-      parent = parent[key];
+      let child = parent[key];
+      if (child && typeof child === 'object' && !copied.has(child)) { child = copy(child); parent[key] = child; }
+      parent = child;
     }
     const key = keys.at(-1);
     if (!parent || typeof parent !== 'object' || !['add', 'replace', 'remove'].includes(patch.op)) throw new Error('Invalid patch');
@@ -70,7 +76,7 @@ export class DesktopIpc extends EventEmitter {
     const current = path.join(process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex'), 'ipc', 'ipc.sock');
     this.socketPath = options.socketPath ?? (existsSync(current) ? current : path.join(os.tmpdir(), 'codex-ipc', `ipc-${process.getuid()}.sock`));
     this.timeoutMs = options.timeoutMs ?? 5000;
-    this.submitted = new Map(); this.pending = new Map(); this.requests = new Map(); this.asyncAnswered = new Set(); this.buffer = Buffer.alloc(0);
+    this.textPending = new Map(); this.submitted = new Map(); this.pending = new Map(); this.requests = new Map(); this.asyncAnswered = new Set(); this.buffer = Buffer.alloc(0);
     this.clientId = 'initializing-client'; this.closed = true;
   }
   select(threadId) {
@@ -141,7 +147,7 @@ export class DesktopIpc extends EventEmitter {
       if (!pending) return;
       clearTimeout(pending.timer); this.pending.delete(frame.requestId);
       if (frame.resultType === 'success') pending.resolve(frame.result);
-      else pending.reject(new Error('Desktop rejected request')); // Do not expose private payloads.
+      else pending.reject(Object.assign(new Error('Desktop rejected request'), { code: 'DESKTOP_REJECTED' })); // Do not expose private payloads.
     } else if (frame.type === 'client-discovery-request') {
       this.write({ type: 'client-discovery-response', requestId: frame.requestId, response: { canHandle: false } });
     } else if (this.threadId !== null && frame.type === 'broadcast' && frame.method === 'thread-stream-state-changed' && frame.params?.conversationId === this.threadId) {
@@ -151,6 +157,9 @@ export class DesktopIpc extends EventEmitter {
       else return;
       if (typeof frame.sourceClientId !== 'string' || !this.state || typeof this.state !== 'object') return;
       this.owner = frame.sourceClientId;
+      const textPending = this.textPending.get(this.threadId);
+      if (textPending && (desktopStatus(this.state) === 'running' ||
+          ((this.state.turns ?? []).at(-1)?.id && (this.state.turns ?? []).at(-1).id !== textPending.lastTurnId))) this.textPending.delete(this.threadId);
       const extracted = extractDesktopQuestions({ ...this.state, id: this.threadId });
       const currentAsyncIds = new Set(extracted.requests.map(request => request.questionItemId));
       for (const id of this.asyncAnswered) if (!currentAsyncIds.has(id)) this.asyncAnswered.delete(id);
@@ -202,6 +211,31 @@ export class DesktopIpc extends EventEmitter {
       if (this.requests.get(String(reply.id)) === entry) this.requests.delete(String(reply.id));
     }
   }
+  textTarget() {
+    if (this.closed || !this.threadId || !this.owner || !this.state || this.textPending.has(this.threadId) || desktopStatus(this.state) === 'running' ||
+        this.requests.size || this.state.requests?.length) {
+      throw Object.assign(new Error('Desktop chat unavailable or busy'), { code: 'DESKTOP_TARGET' });
+    }
+    return { threadId: this.threadId, generation: this.generation, owner: this.owner };
+  }
+  async submitText(target, text) {
+    const current = this.textTarget();
+    if (!target || current.threadId !== target.threadId || current.generation !== target.generation || current.owner !== target.owner ||
+        typeof text !== 'string' || !text.trim() || Buffer.byteLength(text) > 16000) {
+      throw Object.assign(new Error('Stale target or invalid text'), { code: 'DESKTOP_TARGET' });
+    }
+    const pending = { threadId: target.threadId, lastTurnId: (this.state.turns ?? []).at(-1)?.id };
+    this.textPending.set(target.threadId, pending);
+    try {
+      return await this.rpc('thread-follower-start-turn', {
+        conversationId: target.threadId,
+        turnStart: { request: { threadId: target.threadId, input: [{ type: 'text', text, text_elements: [] }] }, context: {} },
+      }, 2, target.owner);
+    } catch (error) {
+      if (error.code === 'DESKTOP_REJECTED' && this.textPending.get(target.threadId) === pending) this.textPending.delete(target.threadId);
+      throw error;
+    }
+  }
   async submitAsyncQuestion(entry, answer) {
     if (!entry?.asyncQuestion || !entry.request?.questionItemId) throw new Error('Not an async question');
     const question = entry.request.params.questions[0];
@@ -209,7 +243,7 @@ export class DesktopIpc extends EventEmitter {
     const result = await this.rpc('thread-follower-start-turn', {
       conversationId: this.threadId,
       turnStart: { request: { threadId: this.threadId, input: [{ type: 'text', text, text_elements: [] }] }, context: {} },
-    }, 1, entry.owner);
+    }, 2, entry.owner);
     this.asyncAnswered.add(entry.request.questionItemId);
     this.requests.delete(String(entry.request.id));
     return result;

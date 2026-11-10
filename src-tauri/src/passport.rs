@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{Manager, State};
 
@@ -26,14 +26,30 @@ pub struct Status {
     running: bool,
     connected: bool,
     failed: bool,
+    /// A voice/text submission whose delivery could not be confirmed is blocking new input.
+    uncertain_submission: bool,
     message: String,
 }
+/// Authenticated loopback access to the running Bridge's local control API.
+#[derive(Clone)]
+struct Probe {
+    client: reqwest::blocking::Client,
+    port: u16,
+    token: String,
+}
+impl Probe {
+    fn url(&self, path: &str) -> String {
+        format!("https://127.0.0.1:{}{path}", self.port)
+    }
+}
+/// How long the Bridge gets to close device sockets and its children after SIGTERM.
+const STOP_GRACE: Duration = Duration::from_secs(2);
 #[derive(Default)]
 pub struct Bridge {
     config: Config,
     failure: Option<String>,
     child: Option<Child>,
-    probe: Option<(reqwest::blocking::Client, u16)>,
+    probe: Option<Probe>,
 }
 pub struct PassportState(pub Arc<Mutex<Bridge>>);
 impl Default for PassportState {
@@ -51,10 +67,23 @@ impl Bridge {
             {
                 #[cfg(unix)]
                 {
-                    // Child owns a new process group, including optional quota workers.
-                    if unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) } != 0 {
+                    // Child owns a new process group, including its codex app-server workers.
+                    // Ask politely first so the Bridge can close device sockets, then force.
+                    let group = -(child.id() as i32);
+                    if unsafe { libc::kill(group, libc::SIGTERM) } != 0 {
                         return Err("无法停止 Bridge 进程组".into());
                     }
+                    let deadline = Instant::now() + STOP_GRACE;
+                    while child
+                        .try_wait()
+                        .map_err(|_| "无法检查 Bridge 进程")?
+                        .is_none()
+                        && Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    // Reap stragglers in the group; ESRCH just means everything already exited.
+                    unsafe { libc::kill(group, libc::SIGKILL) };
                 }
                 #[cfg(windows)]
                 {
@@ -78,7 +107,8 @@ impl Bridge {
         self.failure = None;
         Ok(())
     }
-    fn status(&mut self) -> Result<Status, String> {
+    /// Process state only; cheap enough to compute while holding the Bridge lock.
+    fn local_status(&mut self) -> Result<(Status, Option<Probe>), String> {
         let mut message = self
             .failure
             .clone()
@@ -96,40 +126,55 @@ impl Bridge {
             }
         }
         let running = self.child.is_some();
-        let mut connected = false;
         if running {
             message = "正在启动或等待 Bridge 响应".into();
-            if let Some((client, port)) = &self.probe {
-                if let Ok(response) = client
-                    .get(format!("https://127.0.0.1:{port}/healthz"))
-                    .send()
-                {
-                    if let Ok(value) = response
-                        .error_for_status()
-                        .and_then(|r| r.json::<serde_json::Value>())
-                    {
-                        connected = value
-                            .get("connected")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        message = if connected {
-                            "设备已连接"
-                        } else {
-                            "Bridge 已启动，等待设备连接"
-                        }
-                        .into();
-                    }
-                }
-            }
         }
-        Ok(Status {
+        let status = Status {
             config: self.config.clone(),
             running,
-            connected,
+            connected: false,
             failed: self.failure.is_some(),
+            uncertain_submission: false,
             message,
-        })
+        };
+        Ok((status, running.then(|| self.probe.clone()).flatten()))
     }
+    fn status(&mut self) -> Result<Status, String> {
+        let (mut status, probe) = self.local_status()?;
+        if let Some(probe) = probe {
+            apply_probe(&mut status, &probe);
+        }
+        Ok(status)
+    }
+}
+/// Network round trip to the Bridge; callers run it without holding the Bridge lock.
+fn apply_probe(status: &mut Status, probe: &Probe) {
+    let Ok(value) = probe
+        .client
+        .get(probe.url("/desktop/state"))
+        .bearer_auth(&probe.token)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.json::<serde_json::Value>())
+    else {
+        return;
+    };
+    status.connected = value
+        .get("deviceConnected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    status.uncertain_submission = value
+        .pointer("/submission/state")
+        .and_then(serde_json::Value::as_str)
+        == Some("uncertain");
+    status.message = if status.uncertain_submission {
+        "上一次语音提交结果未确认，新的语音输入已暂停"
+    } else if status.connected {
+        "设备已连接"
+    } else {
+        "Bridge 已启动，等待设备连接"
+    }
+    .into();
 }
 impl Drop for Bridge {
     fn drop(&mut self) {
@@ -181,15 +226,23 @@ fn environment(path: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(env)
 }
 fn read_status(app: tauri::AppHandle, state: Arc<Mutex<Bridge>>) -> Result<Status, String> {
-    let mut bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
-    if bridge.child.is_none() && bridge.config.environment_file.is_empty() {
-        if let Some(config) = managed::existing(&app)? {
-            bridge.config = config;
-        } else if let Ok(bytes) = fs::read(config_path(&app)?) {
-            bridge.config = serde_json::from_slice(&bytes).map_err(|_| "Meter Bridge 配置损坏")?;
+    let (mut status, probe) = {
+        let mut bridge = state.lock().map_err(|_| "Bridge 管理器不可用")?;
+        if bridge.child.is_none() && bridge.config.environment_file.is_empty() {
+            if let Some(config) = managed::existing(&app)? {
+                bridge.config = config;
+            } else if let Ok(bytes) = fs::read(config_path(&app)?) {
+                bridge.config =
+                    serde_json::from_slice(&bytes).map_err(|_| "Meter Bridge 配置损坏")?;
+            }
         }
+        bridge.local_status()?
+    };
+    // The HTTPS probe can take up to its timeout; toggling and binding must not wait on it.
+    if let Some(probe) = probe {
+        apply_probe(&mut status, &probe);
     }
-    bridge.status()
+    Ok(status)
 }
 fn configure(
     app: tauri::AppHandle,
@@ -247,6 +300,7 @@ fn toggle(state: Arc<Mutex<Bridge>>, enabled: bool) -> Result<Status, String> {
     // Never attach to or terminate a service already using this port.
     let reservation = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port))
         .map_err(|_| "端口已占用；请关闭已有 Bridge 或配置其他端口")?;
+    let control_token = env["PASSPORT_TOKEN"].clone();
     let cert = fs::read(&env["PASSPORT_TLS_CERT"]).map_err(|_| "无法读取 TLS 证书")?;
     let cert = reqwest::Certificate::from_pem(&cert).map_err(|_| "无效 TLS 证书")?;
     let client = reqwest::blocking::Client::builder()
@@ -297,7 +351,11 @@ fn toggle(state: Arc<Mutex<Bridge>>, enabled: bool) -> Result<Status, String> {
             .spawn()
             .map_err(|_| "无法启动 Bridge；请检查 Node 运行时与脚本")?,
     );
-    bridge.probe = Some((client, port));
+    bridge.probe = Some(Probe {
+        client,
+        port,
+        token: control_token,
+    });
     bridge.status()
 }
 #[tauri::command]
@@ -354,6 +412,39 @@ pub async fn passport_toggle(
     })
     .await
     .map_err(|_| "Bridge 启停任务失败")?
+}
+/// The user checked the chat on the computer and chose to unblock voice input. Nothing is resent.
+#[tauri::command]
+pub async fn passport_release_submission(
+    state: State<'_, PassportState>,
+) -> Result<Status, String> {
+    let state = Arc::clone(&state.0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let probe = state
+            .lock()
+            .map_err(|_| "Bridge 管理器不可用")?
+            .probe
+            .clone()
+            .ok_or("Bridge 未运行")?;
+        probe
+            .client
+            .post(probe.url("/desktop/submission/release"))
+            .bearer_auth(&probe.token)
+            .body("{}")
+            .send()
+            .and_then(|response| response.error_for_status())
+            .map_err(|_| "无法解除：没有待确认的提交，或 Bridge 未响应")?;
+        let (mut status, probe) = state
+            .lock()
+            .map_err(|_| "Bridge 管理器不可用")?
+            .local_status()?;
+        if let Some(probe) = probe {
+            apply_probe(&mut status, &probe);
+        }
+        Ok(status)
+    })
+    .await
+    .map_err(|_| "解除任务失败")?
 }
 #[cfg(test)]
 mod tests {
@@ -451,7 +542,7 @@ mod tests {
             .unwrap();
         assert!(runtime.status.success());
         let script = root.join("server.mjs");
-        fs::write(&script, "import https from 'node:https'; import fs from 'node:fs'; https.createServer({cert:fs.readFileSync(process.env.PASSPORT_TLS_CERT),key:fs.readFileSync(process.env.PASSPORT_TLS_KEY)},(req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({connected:true}));}).listen(Number(process.env.PASSPORT_PORT),'0.0.0.0');").unwrap();
+        fs::write(&script, "import https from 'node:https'; import fs from 'node:fs'; https.createServer({cert:fs.readFileSync(process.env.PASSPORT_TLS_CERT),key:fs.readFileSync(process.env.PASSPORT_TLS_KEY)},(req,res)=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify({deviceConnected:true,submission:null}));}).listen(Number(process.env.PASSPORT_PORT),'0.0.0.0');").unwrap();
         let existing = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = existing.local_addr().unwrap().port();
         let env_file = root.join("environment.json");

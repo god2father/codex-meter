@@ -382,9 +382,12 @@ mod tests {
     #[test]
     fn monitoring_switches_persist_and_default_to_codex_only() {
         let directory = std::env::temp_dir().join(format!(
-            "codex-meter-monitoring-{}-{:?}",
+            "codex-meter-monitoring-{}-{}",
             std::process::id(),
-            Instant::now()
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
         ));
         let hub = UsageHub::new();
         hub.load_preferences(Some(directory.clone()));

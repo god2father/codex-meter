@@ -98,7 +98,15 @@ function askAssistantQuestion(questions) {
   assistantQuestion = { id, threadId: app.threadId, state: 'pending', generation: app.generation, deviceGeneration };
   publish(); return questionState(id);
 }
+// Desktop streams many small patches while a reply is generated; coalesce those pushes so the
+// device is not flooded. Anything else (approvals, selection, errors) still publishes at once.
+const PUBLISH_COALESCE_MS = 250;
+let publishTimer;
+function publishSoon() {
+  if (!publishTimer) publishTimer = setTimeout(() => { publishTimer = undefined; publish(); }, PUBLISH_COALESCE_MS);
+}
 function publish() {
+  clearTimeout(publishTimer); publishTimer = undefined;
   const limits = quota?.snapshot() ?? null;
   const lineFor = window => {
     if (!window) return '额度：待更新';
@@ -174,13 +182,21 @@ const server = createBridgeServer(config, async (req, res) => {
 const ws = new WebSocketServer({ noServer: true, maxPayload: 4096 });
 server.on('upgrade', (req, socket, head) => {
   if (req.url !== '/passport' || (req.headers.origin && !demo) ||
-      (!demo && !simulator && req.headers.authorization !== `Bearer ${deviceToken}`) || device) {
+      (!demo && !simulator && req.headers.authorization !== `Bearer ${deviceToken}`)) {
     socket.write('HTTP/1.1 403 Forbidden\r\n\r\n'); socket.destroy(); return;
   }
   ws.handleUpgrade(req, socket, head, client => ws.emit('connection', client));
 });
+// Shared by close and replacement: drop everything tied to the departing connection.
+function detachDevice() {
+  device = undefined; voice?.invalidate(); textSubmission?.invalidate(); deviceChats?.invalidate(); contentReader?.invalidateHistory();
+  if (desktop) queue.requests.clear(); else queue.cancelAll();
+}
 ws.on('connection', client => {
   enrollment?.finish();
+  // An authenticated reconnect replaces a half-open socket left by a Wi-Fi drop instead of
+  // waiting for the heartbeat to notice it.
+  if (device && device !== client) { const stale = device; detachDevice(); stale.terminate(); }
   device = client; deviceGeneration++;
   client.alive = true;
   client.on('pong', () => { client.alive = true; });
@@ -263,7 +279,7 @@ ws.on('connection', client => {
     } catch { if (device === client && client.readyState === 1) { client.send(JSON.stringify({ type: 'error', message: '无效或已过期的请求', ...(chatRequestId === undefined ? {} : { requestId: chatRequestId }), ...(historyThreadId === undefined ? {} : { threadId: historyThreadId }) })); publish(); } }
   });
   client.on('error', () => client.terminate());
-  client.on('close', () => { if (device === client) { device = undefined; voice?.invalidate(); textSubmission?.invalidate(); deviceChats?.invalidate(); contentReader?.invalidateHistory(); if (desktop) queue.requests.clear(); else queue.cancelAll(); } });
+  client.on('close', () => { if (device === client) detachDevice(); });
 });
 let stopping = false;
 let reconnectTimer;
@@ -301,7 +317,9 @@ if (desktop) {
   const chats = readDesktopChats(process.env.PASSPORT_DESKTOP_CHATS);
   const titleFor = id => Array.from(chats.find(chat => chat.id === id)?.title ?? '').slice(0, 64).join('').replace(/[\p{Cc}\u2028\u2029]/gu, ' ');
   handleDesktopControl = desktopControl({ config, app, chats,
-    askQuestion: askAssistantQuestion, getQuestion: questionState, getQuota: () => quota?.snapshot() ?? null });
+    askQuestion: askAssistantQuestion, getQuestion: questionState, getQuota: () => quota?.snapshot() ?? null,
+    getDevice: () => ({ deviceConnected: device?.readyState === 1, submission: textSubmission?.snapshot() ?? null }),
+    releaseSubmission: () => { const result = textSubmission.release(); voice.syncSubmission(); publish(); return result; } });
   session = new PassportSession(app, publish);
   textSubmission = new TextSubmission(app);
   voice = new VoiceSession({ app, submission: textSubmission,
@@ -330,7 +348,8 @@ if (desktop) {
     const turn = turns.at(-1);
     session.turnId = turn?.id ?? null;
     session.state = desktopStatus(state);
-    publish();
+    if (textSubmission.observe(state)) voice.syncSubmission();
+    publishSoon();
   });
   app.on('request', (request, state) => forwardDesktop(request, state));
   app.on('closed', () => {
@@ -392,5 +411,9 @@ const expiry = setInterval(() => {
   } else if (queue.expire()) publish();
 }, 1000);
 expiry.unref();
-function shutdown() { contentReader?.close(); deviceChats?.close(); enrollment?.close(); stopping = true; quota?.stop(); clearTimeout(reconnectTimer); clearInterval(heartbeat); clearInterval(expiry); if (desktop) queue.requests.clear(); else queue.cancelAll(); device?.close(); ws.close(); server.close(); app?.close(); }
+function shutdown() {
+  if (stopping) return;
+  // Meter sends SIGTERM and escalates after a grace period; never linger past it.
+  setTimeout(() => process.exit(0), 1500);
+  clearTimeout(publishTimer); contentReader?.close(); deviceChats?.close(); enrollment?.close(); stopping = true; quota?.stop(); clearTimeout(reconnectTimer); clearInterval(heartbeat); clearInterval(expiry); if (desktop) queue.requests.clear(); else queue.cancelAll(); device?.close(); ws.close(); server.close(); app?.close(); }
 process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);

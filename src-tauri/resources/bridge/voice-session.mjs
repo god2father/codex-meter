@@ -93,6 +93,14 @@ export class VoiceSession {
     if (item.state === 'accepted') item.parts = [];
     return this.snapshot();
   }
+  // Mirrors a resolved text submission (observed or released) onto the voice item.
+  syncSubmission() {
+    const item = this.current, submission = this.submission.current;
+    if (item?.state !== 'uncertain' || !submission || submission.id !== item.submissionId ||
+        !['accepted', 'released'].includes(submission.state)) return false;
+    item.state = submission.state; item.parts = [];
+    this.publish(); return true;
+  }
   invalidate() {
     const item = this.current;
     if (item && ['recording', 'transcribing', 'preview'].includes(item.state)) this.cancel(item.id);

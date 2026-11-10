@@ -4,8 +4,8 @@ mod codex;
 mod macos_tray;
 mod passport;
 use passport::{
-    passport_configure, passport_enrollment, passport_pairing, passport_status, passport_toggle,
-    PassportState,
+    passport_configure, passport_enrollment, passport_pairing, passport_release_submission,
+    passport_status, passport_toggle, PassportState,
 };
 mod scheduler;
 mod token_usage;
@@ -813,6 +813,7 @@ pub fn run() {
             passport_enrollment,
             passport_configure,
             passport_toggle,
+            passport_release_submission,
             request_usage_refresh,
             runtime_platform,
             native_glass,

@@ -35,8 +35,12 @@ function requestFingerprint(owner, request, state) {
   return JSON.stringify({ owner, request, details });
 }
 
+// Copy-on-write along each patch path: the source stays untouched, but unchanged branches are
+// shared instead of deep-cloning the whole conversation for every streamed patch.
 export function patchState(state, patches) {
-  const result = structuredClone(state);
+  const copied = new WeakSet();
+  const copy = value => { const result = Array.isArray(value) ? [...value] : { ...value }; copied.add(result); return result; };
+  const result = copy(state);
   for (const patch of patches) {
     const keys = patch.path;
     if (!Array.isArray(keys) || !keys.length || keys.some(k =>
@@ -45,7 +49,9 @@ export function patchState(state, patches) {
     let parent = result;
     for (const key of keys.slice(0, -1)) {
       if (!parent || typeof parent !== 'object' || !Object.hasOwn(parent, key)) throw new Error('Missing patch parent');
-      parent = parent[key];
+      let child = parent[key];
+      if (child && typeof child === 'object' && !copied.has(child)) { child = copy(child); parent[key] = child; }
+      parent = child;
     }
     const key = keys.at(-1);
     if (!parent || typeof parent !== 'object' || !['add', 'replace', 'remove'].includes(patch.op)) throw new Error('Invalid patch');

@@ -36,21 +36,24 @@ document.querySelector('#unlock').onsubmit=event=>{event.preventDefault();perfor
 chats.onchange=()=>{thread.value=chats.value;};form.onsubmit=event=>{event.preventDefault();perform(async()=>{const id=thread.value.trim();if(!id)throw new Error('请选择聊天或填写聊天 ID');show(await request('/desktop/select',{threadId:id}));});};document.querySelector('#clear').onclick=()=>perform(async()=>{show(await request('/desktop/select',{threadId:null}));});
 setInterval(()=>{if(!form.hidden&&!busy)perform(async()=>show(await request('/desktop/state')));},2000);`;
 
-export function desktopControl({ config, app, chats, askQuestion, getQuestion, getQuota = () => null }) {
-  const state = () => ({ threadId: app.threadId, connected: !app.closed, synced: app.state !== undefined, chats, quota: getQuota() });
+export function desktopControl({ config, app, chats, askQuestion, getQuestion, getQuota = () => null,
+  getDevice = () => ({ deviceConnected: false, submission: null }), releaseSubmission = () => { throw new Error('Unsupported'); } }) {
+  const state = () => ({ threadId: app.threadId, connected: !app.closed, synced: app.state !== undefined, chats, quota: getQuota(), ...getDevice() });
   return async (req, res) => {
     let url;
     try { url = new URL(req.url, 'http://localhost'); }
     catch { res.writeHead(400); res.end('Invalid URL'); return true; }
     const endpoint = url.pathname;
-    if (!['/desktop', '/desktop.css', '/desktop.js', '/desktop/state', '/desktop/select', '/desktop/question'].includes(endpoint)) return false;
+    if (!['/desktop', '/desktop.css', '/desktop.js', '/desktop/state', '/desktop/select', '/desktop/question', '/desktop/submission/release'].includes(endpoint)) return false;
     if (!localDesktopRequest(req, config)) { res.writeHead(403); res.end(); return true; }
     const asset = { '/desktop': [page, 'text/html; charset=utf-8'], '/desktop.css': [css, 'text/css'], '/desktop.js': [script, 'text/javascript'] }[endpoint];
     if (asset && req.method === 'GET') { res.writeHead(200, headers(asset[1])); res.end(asset[0]); return true; }
     if (req.headers.authorization !== `Bearer ${config.token}`) { res.writeHead(403); res.end(); return true; }
     try {
       let result;
-      if (['/desktop/select', '/desktop/question'].includes(endpoint) && req.method === 'POST') {
+      if (endpoint === '/desktop/submission/release' && req.method === 'POST') {
+        releaseSubmission();
+      } else if (['/desktop/select', '/desktop/question'].includes(endpoint) && req.method === 'POST') {
         let body = ''; req.setEncoding('utf8');
         for await (const chunk of req) { body += chunk; if (Buffer.byteLength(body) > 1024) throw new Error('Request too large'); }
         const input = JSON.parse(body);

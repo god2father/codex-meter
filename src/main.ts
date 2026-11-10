@@ -18,7 +18,7 @@ type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "
 type RuntimePlatform = "windows" | "macos" | "other";
 
 interface PassportConfig { runtime: string; script: string; environmentFile: string }
-interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; message: string }
+interface PassportStatus { config: PassportConfig; running: boolean; connected: boolean; failed?: boolean; uncertainSubmission?: boolean; message: string }
 let passport: PassportStatus = { config: { runtime: "", script: "", environmentFile: "" }, running: false, connected: false, message: "已关闭" };
 let passportBusy = false;
 let passportReading = false;
@@ -493,6 +493,16 @@ function passportStateLabel(): string {
   return passport.failed ? "启动失败" : passportError ? "连接异常" : passport.connected ? "设备已连接" : passport.running ? "等待设备" : "已关闭";
 }
 
+// Delivery of the last voice/text submission is unknown; new input stays blocked until the user
+// checks the chat on this computer. Releasing never resends anything.
+function renderUncertainSubmission(): string {
+  if (!passport.uncertainSubmission) return "";
+  return `<div class="uncertain-submission" role="alert">
+    <p>上一次语音提交是否送达无法确认，新的语音输入已暂停。请先在电脑上查看该聊天：已送达就不要重发。</p>
+    <button class="text-button" data-action="passport-release" ${passportBusy ? "disabled" : ""}>已检查，解除</button>
+  </div>`;
+}
+
 function renderPassport(): string {
   const tone = passportError || passport.failed ? "error" : passport.connected ? "connected" : passport.running ? "waiting" : "offline";
   const label = passportBusy ? "正在处理" : passportStateLabel();
@@ -503,6 +513,7 @@ function renderPassport(): string {
       <label class="setting-toggle passport-switch"><input type="checkbox" data-setting="passport" aria-label="Passport 连接开关" ${passport.running ? "checked" : ""} ${passportBusy || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
       <button class="icon-button" data-action="passport-setup" title="Passport 设置" aria-label="Passport 设置">${icon("settings")}</button>
     </div>
+    ${renderUncertainSubmission()}
     ${passportError ? `<p class="inline-error" role="alert">${escapePassport(passportError)}</p>` : ""}
   </section>`;
 }
@@ -1184,6 +1195,9 @@ app.addEventListener("click", async (event) => {
     case "passport-toggle":
       await passportCommand("passport_toggle", { enabled: !passport.running });
       app.querySelector<HTMLButtonElement>('[data-action="passport-toggle"]')?.focus();
+      break;
+    case "passport-release":
+      await passportCommand("passport_release_submission");
       break;
     case "passport-bind":
       await generatePairing();

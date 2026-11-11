@@ -179,6 +179,8 @@ const mockClaudeSnapshot: ClaudeUsageSnapshot = {
 };
 
 const CACHE_KEY = "codex-meter:last-usage";
+const TRAY_SOURCE_KEY = "codex-meter:tray-source";
+type TraySource = "codex" | "claude";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 let snapshot: UsageSnapshot | null = isTauri ? loadCachedSnapshot() : mockSnapshot;
@@ -197,6 +199,8 @@ let claudeQuota: ClaudeQuotaSnapshot | null = isTauri ? null : {
   sevenDayOpus: { usedPercent: 44, remainingPercent: 56, resetsAt: Math.floor(Date.now() / 1000) + 2.5 * 86400 },
 };
 let claudeDetailsOpen = false;
+/** Set for the one render that opens a details table, so background refreshes do not replay its fade-in. */
+let detailsEntering: "token" | "claude" | null = null;
 // Matches the backend default until monitoring_status answers; the browser preview shows both.
 let monitoring: Monitoring = isTauri ? { codex: true, claude: false, claudeQuota: false } : { codex: true, claude: true, claudeQuota: true };
 let monitoringBusy: UsageSource | null = null;
@@ -214,6 +218,7 @@ let panelResizeObserver: ResizeObserver | null = null;
 let lastRenderedFreshness: DataFreshness | null = null;
 let freshnessExpiryTimer = 0;
 let lastTrayKey = "";
+let trayPreference: TraySource = loadTrayPreference();
 let exitArmed = false;
 let exitArmTimer = 0;
 
@@ -244,28 +249,30 @@ function formatPlan(plan: string): string {
   return knownPlans[plan.toLowerCase()] ?? plan;
 }
 
+const clockTime = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+
+/** Countdown inside a day, weekday inside a week, date beyond that. */
 function formatReset(unixSeconds: number | null): string {
   if (unixSeconds === null) return "重置时间未知";
+  const minutes = Math.round((unixSeconds - Date.now() / 1000) / 60);
+  if (minutes <= 0) return "即将重置";
+  if (minutes < 60) return `${minutes} 分钟后重置`;
+  if (minutes < 24 * 60) {
+    const rest = minutes % 60;
+    return rest ? `${Math.floor(minutes / 60)} 小时 ${rest} 分后重置` : `${minutes / 60} 小时后重置`;
+  }
   const date = new Date(unixSeconds * 1000);
-  const now = new Date();
-  const tomorrow = new Date(now);
-  tomorrow.setDate(now.getDate() + 1);
-  const sameDay = date.toDateString() === now.toDateString();
-  const nextDay = date.toDateString() === tomorrow.toDateString();
-  const time = new Intl.DateTimeFormat("zh-CN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date);
-  if (sameDay) return `今天 ${time} 重置`;
-  if (nextDay) return `明天 ${time} 重置`;
-  return `${new Intl.DateTimeFormat("zh-CN", {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(date)} 重置`;
+  if (minutes < 7 * 24 * 60) {
+    return `${new Intl.DateTimeFormat("zh-CN", { weekday: "short" }).format(date)} ${clockTime.format(date)} 重置`;
+  }
+  return `${date.getMonth() + 1}/${date.getDate()} ${clockTime.format(date)} 重置`;
+}
+
+/** Exact reset moment for the tooltip behind the relative text. */
+function formatResetExact(unixSeconds: number | null): string {
+  if (unixSeconds === null) return "";
+  const date = new Date(unixSeconds * 1000);
+  return `${date.getMonth() + 1} 月 ${date.getDate()} 日 ${clockTime.format(date)} 重置`;
 }
 
 function formatUpdated(unixSeconds: number): string {
@@ -321,10 +328,11 @@ function usageTone(remaining: number): "healthy" | "warning" | "critical" {
   return "critical";
 }
 
-function usageColor(remaining: number): string {
-  if (usageTone(remaining) === "warning") return "#f2ae42";
-  if (usageTone(remaining) === "critical") return "#f16676";
-  return "#39d7bc";
+/** Ring colour; the darker set keeps 3:1 against a light macOS menu bar. */
+function usageColor(remaining: number, lightSurface = false): string {
+  if (usageTone(remaining) === "warning") return lightSurface ? "#b9730f" : "#f2ae42";
+  if (usageTone(remaining) === "critical") return lightSurface ? "#c93a4b" : "#f16676";
+  return lightSurface ? "#0f8c6c" : "#39d7bc";
 }
 
 function usageQuip(remaining: number): string {
@@ -361,7 +369,7 @@ function statusCopy(freshness = dataFreshness()): { label: string; detail: strin
 
 function footerStatusCopy(freshness = dataFreshness()): string {
   if (!monitoring.codex) return monitoring.claude ? "仅监测 Claude Code" : "监测已全部关闭";
-  if (freshness === "fresh" && snapshot) return `Codex 额度 · ${formatUpdated(snapshot.fetchedAt)}`;
+  if (freshness === "fresh" && snapshot) return snapshot.status === "limit_reached" ? "Codex 额度已用尽，等待重置" : "";
   if (freshness === "reconnecting" && snapshot) {
     const action = refreshing && !errorMessage ? "正在同步" : "正在重连";
     return `${action} · 显示 ${dataAgeMinutes(snapshot)} 分钟前的数据`;
@@ -370,6 +378,15 @@ function footerStatusCopy(freshness = dataFreshness()): string {
     return `数据已过期 · 上次成功更新于 ${dataAgeMinutes(snapshot)} 分钟前`;
   }
   return statusCopy(freshness).detail;
+}
+
+/** Line under the title: how fresh the numbers are, for whichever source is being watched. */
+function headerSubtitle(freshness = dataFreshness()): string {
+  if (settingsOpen) return "你的桌面，按你的习惯";
+  if (monitoring.codex) return freshness === "fresh" && snapshot ? formatUpdated(snapshot.fetchedAt) : "Codex · Claude 用量";
+  if (!monitoring.claude) return "Codex · Claude 用量";
+  const fetchedAt = (monitoring.claudeQuota ? claudeQuota?.fetchedAt : undefined) ?? claudeSnapshot?.fetchedAt;
+  return fetchedAt ? formatUpdated(fetchedAt) : "Codex · Claude 用量";
 }
 
 function scheduleFreshnessExpiry(): void {
@@ -381,6 +398,27 @@ function scheduleFreshnessExpiry(): void {
     render();
     void updateTrayIcon(snapshot);
   }, remainingSeconds * 1000 + 50);
+}
+
+function loadTrayPreference(): TraySource {
+  try {
+    return localStorage.getItem(TRAY_SOURCE_KEY) === "claude" ? "claude" : "codex";
+  } catch {
+    return "codex";
+  }
+}
+
+/** Sources able to drive the tray ring. Claude needs its subscription windows; token counts have no percentage. */
+function traySources(): TraySource[] {
+  const sources: TraySource[] = [];
+  if (monitoring.codex) sources.push("codex");
+  if (monitoring.claude && monitoring.claudeQuota) sources.push("claude");
+  return sources;
+}
+
+function activeTraySource(): TraySource {
+  const available = traySources();
+  return available.includes(trayPreference) ? trayPreference : available[0] ?? "codex";
 }
 
 function loadCachedSnapshot(): UsageSnapshot | null {
@@ -495,21 +533,25 @@ function renderMonitorOff(source: UsageSource): string {
   </section>`;
 }
 
-function renderQuota(): string {
-  const data = snapshot;
-  const windows = [data?.primary, data?.secondary].filter(Boolean) as LimitWindow[];
-  const status = statusCopy();
-  return `<section class="quota-strip" aria-label="订阅剩余额度">
-    <div class="section-caption"><span>Codex 剩余额度</span><span class="caption-end"><span>${data?.planType ? escapeHtml(formatPlan(data.planType)) : ""}${data?.resetCreditsAvailable != null ? ` · 可重置 ${Math.max(0, Math.floor(data.resetCreditsAvailable))} 次` : ""}</span>${sourceSwitch("codex")}</span></div>
-    ${windows.length ? `<div class="quota-grid">${windows.map(item => {
-      const value = remainingOf(item);
-      return `<div class="quota-window" data-tone="${usageTone(value)}">
-        <div class="quota-heading"><span>${formatWindow(item.windowDurationMins)}</span><strong>${value}<small>%</small></strong></div>
-        <div class="quota-track" role="meter" aria-label="${formatWindow(item.windowDurationMins)}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
-        <span class="reset-time">${formatReset(item.resetsAt)}</span>
-      </div>`;
-    }).join("")}</div>` : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapeHtml(status.label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
-  </section>`;
+/** One remaining-quota column: label, big percentage, bar and reset time. */
+function quotaCell(source: string, label: string, remaining: number, resetsAt: number | null): string {
+  const value = clampPercent(remaining);
+  return `<div class="quota-window" data-tone="${usageTone(value)}">
+    <div class="quota-heading"><span>${label}</span><strong>${value}<small>%</small></strong></div>
+    <div class="quota-track" role="meter" aria-label="${source} ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
+    <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
+  </div>`;
+}
+
+/** Shared card header: source mark and name, plan, and the details toggle. */
+function cardHead(source: "codex" | "claude", plan: string, open: boolean): string {
+  const [name, mark, action, controls] = source === "codex"
+    ? ["Codex", `<span class="token-mark">${icon("app")}</span>`, "token-details", "token-details"]
+    : ["Claude Code", `<span class="token-mark claude-mark">${icon("spark")}</span>`, "claude-details", "claude-details"];
+  return `<div class="token-card-head">
+    <div>${mark}<strong>${name}</strong>${plan ? `<span class="card-plan">${plan}</span>` : ""}</div>
+    <button class="token-detail-button" data-action="${action}" aria-expanded="${open}" aria-controls="${controls}">${open ? "收起" : "明细"}${icon("chevron")}</button>
+  </div>`;
 }
 
 function renderSettings(): string {
@@ -517,6 +559,7 @@ function renderSettings(): string {
     <div class="section-caption"><span>通用</span></div>
     <div class="settings-group">
       <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>登录时启动</span><small>自动驻留托盘</small></span></span><input type="checkbox" data-setting="autostart" aria-label="登录时启动" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
+      ${traySources().length > 1 ? `<div class="setting-row"><span class="setting-label"><i>${icon("app")}</i><span class="setting-copy"><span>托盘显示</span><small>圆环与小猫跟随所选来源</small></span></span><div class="segmented" role="radiogroup" aria-label="托盘显示来源">${(["codex", "claude"] as TraySource[]).map(source => `<button role="radio" aria-checked="${activeTraySource() === source}" data-action="tray-source" data-value="${source}">${source === "codex" ? "Codex" : "Claude"}</button>`).join("")}</div></div>` : ""}
     </div>
     ${autostartError ? `<p class="inline-error" role="alert">${escapeHtml(autostartError)}</p>` : ""}
     <p class="setting-note">外观跟随系统。Codex 额度在后台每分钟刷新，面板打开时每 30 秒；Token 统计每 10–30 秒。</p>
@@ -531,7 +574,7 @@ function renderSettings(): string {
       }).join("")}
     </div>
     ${monitoringError ? `<p class="inline-error" role="alert">${escapeHtml(monitoringError)}</p>` : ""}
-    <p class="settings-footnote">关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
+    <p class="settings-footnote">只读取本机记录里的 Token 数字，不读取对话内容。关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
   </section>`;
 }
 
@@ -552,17 +595,24 @@ function tokenStat(label: string, value: number | undefined, available: boolean,
   const spoken = text === "—" ? "暂无数据" : text;
   return `<div class="token-stat">
     <span aria-hidden="true">${label}${active ? "<i></i>" : ""}</span>
-    <strong aria-label="${label}${active ? "（进行中）" : ""} ${spoken}" title="${spoken}">${text}</strong>
+    <strong aria-label="${label}${active ? "（进行中）" : ""} ${spoken}" title="${spoken}">${text.replace(/[万亿]$/, unit => `<small>${unit}</small>`)}</strong>
   </div>`;
 }
 
-function renderTokenUsage(): string {
+function renderCodexCard(): string {
+  const quota = snapshot;
+  const windows = [quota?.primary, quota?.secondary].filter(Boolean) as LimitWindow[];
+  const plan = [
+    quota?.planType ? escapeHtml(formatPlan(quota.planType)) : "",
+    quota?.resetCreditsAvailable != null ? `可重置 ${Math.max(0, Math.floor(quota.resetCreditsAvailable))} 次` : "",
+  ].filter(Boolean).join(" · ");
   const data = tokenSnapshot;
   const available = Boolean(data?.sourceAvailable);
   const recent = data?.recentTurn ?? null;
   const today = data?.today;
   const session = data?.currentSession ?? null;
-  const stateCopy = tokenError
+  // Only say something when there is a state worth reading; the privacy line lives in settings.
+  const note = tokenError
     ? "Token 统计暂时无法读取"
     : tokenLoading && !data
       ? "正在读取本机统计"
@@ -570,15 +620,15 @@ function renderTokenUsage(): string {
         ? "尚未发现本机 Codex 会话记录"
         : recent?.active
           ? "最近一轮仍在进行"
-          : "仅统计本机 Token，不读取对话内容";
+          : "";
 
   return `
-    <section class="token-card" aria-label="Codex Token 用量">
-      <div class="token-card-head">
-        <div><span class="token-mark">${icon("tokens")}</span><strong>Codex Token</strong></div>
-        <button class="token-detail-button" data-action="token-details" aria-expanded="${tokenDetailsOpen}" aria-controls="token-details">
-          ${tokenDetailsOpen ? "收起" : "明细"}${icon("chevron")}
-        </button>
+    <section class="token-card" aria-label="Codex 用量">
+      ${cardHead("codex", plan, tokenDetailsOpen)}
+      <div class="card-quota" role="group" aria-label="Codex 剩余额度">
+        ${windows.length
+          ? `<div class="quota-grid">${windows.map(item => quotaCell("Codex", formatWindow(item.windowDurationMins), remainingOf(item), item.resetsAt)).join("")}</div>`
+          : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapeHtml(statusCopy().label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
       </div>
       <div class="token-summary-grid" role="group" aria-label="Codex Token 摘要">
         ${tokenStat("最近一轮", recent?.totalTokens, available, Boolean(recent?.active))}
@@ -586,7 +636,7 @@ function renderTokenUsage(): string {
         ${tokenStat("当前会话", session?.totalTokens, available)}
       </div>
       ${tokenDetailsOpen ? `
-        <div class="token-details" id="token-details">
+        <div class="token-details${detailsEntering === "token" ? " is-entering" : ""}" id="token-details">
           <table>
             <caption>Token 分类明细</caption>
             <thead><tr><th scope="col">分类</th><th scope="col">本轮</th><th scope="col">今日</th><th scope="col">会话</th></tr></thead>
@@ -599,18 +649,12 @@ function renderTokenUsage(): string {
             </tbody>
           </table>
         </div>` : ""}
-      <p class="token-note${tokenError ? " token-error" : ""}" role="${tokenError ? "status" : "note"}">${stateCopy}</p>
+      ${note ? `<p class="token-note${tokenError ? " token-error" : ""}" role="status">${note}</p>` : ""}
     </section>`;
 }
 
 function formatModel(model: string): string {
   return model.replace(/^claude-/, "").replace(/-(\d+)-(\d+)$/, " $1.$2").replace(/^./, c => c.toUpperCase());
-}
-
-function formatClaudeReset(unixSeconds: number): string {
-  const minutes = Math.max(0, Math.round((unixSeconds - Date.now() / 1000) / 60));
-  const time = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date(unixSeconds * 1000));
-  return minutes >= 60 ? `${time} 重置 · 剩 ${Math.floor(minutes / 60)} 时 ${minutes % 60} 分` : `${time} 重置 · 剩 ${minutes} 分`;
 }
 
 const CLAUDE_QUOTA_HINT: Record<ClaudeQuotaSnapshot["status"], string> = {
@@ -622,35 +666,25 @@ const CLAUDE_QUOTA_HINT: Record<ClaudeQuotaSnapshot["status"], string> = {
   error: "暂时无法获取 Claude 订阅额度。",
 };
 
-function quotaWindowCell(label: string, item: ClaudeQuotaWindow): string {
-  const value = clampPercent(item.remainingPercent);
-  return `<div class="quota-window" data-tone="${usageTone(value)}">
-    <div class="quota-heading"><span>${label}</span><strong>${value}<small>%</small></strong></div>
-    <div class="quota-track" role="meter" aria-label="Claude ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
-    <span class="reset-time">${formatReset(item.resetsAt)}</span>
-  </div>`;
-}
-
 /** Subscription windows on top of the Claude card; local token stats follow below. */
 function renderClaudeQuota(): string {
   if (!monitoring.claudeQuota) {
-    return `<div class="claude-quota claude-quota--off"><span>订阅额度 <small>用 Claude Code 的登录查询 5 小时与每周额度</small></span>${sourceSwitch("claudeQuota")}</div>`;
+    return `<div class="card-quota card-quota--off"><span>订阅额度 <small>用 Claude Code 的登录查询 5 小时与每周额度</small></span>${sourceSwitch("claudeQuota")}</div>`;
   }
   const data = claudeQuota;
-  const windows: Array<[string, ClaudeQuotaWindow | null]> = [["5 小时", data?.fiveHour ?? null], ["每周", data?.sevenDay ?? null]];
-  const shown = windows.filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]));
-  const extra = [["Opus 每周", data?.sevenDayOpus], ["Sonnet 每周", data?.sevenDaySonnet]]
+  if (!data) return `<div class="card-quota"><p class="token-note">正在查询 Claude 订阅额度…</p></div>`;
+  const shown = ([["5 小时", data.fiveHour], ["每周", data.sevenDay]] as Array<[string, ClaudeQuotaWindow | null]>)
+    .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]));
+  const extra = ([["Opus 每周", data.sevenDayOpus], ["Sonnet 每周", data.sevenDaySonnet]] as Array<[string, ClaudeQuotaWindow | null]>)
     .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]))
     .map(([label, item]) => `${label}剩余 ${clampPercent(item.remainingPercent)}%`).join(" · ");
-  const head = `<div class="section-caption"><span>订阅额度</span><span class="caption-end"><span>${data?.plan ? escapeHtml(formatPlan(data.plan)) : ""}</span>${sourceSwitch("claudeQuota")}</span></div>`;
-  if (!data) return `<div class="claude-quota">${head}<p class="token-note">正在查询 Claude 订阅额度…</p></div>`;
   const hint = data.status !== "ok" ? CLAUDE_QUOTA_HINT[data.status] || data.message || "" : "";
   if (!shown.length) {
-    return `<div class="claude-quota">${head}<p class="token-note claude-quota-hint">${escapeHtml(hint)}</p></div>`;
+    return `<div class="card-quota"><p class="token-note claude-quota-hint">${escapeHtml(hint)}</p></div>`;
   }
   const age = data.stale ? `<p class="token-note claude-quota-hint">显示 ${Math.max(1, Math.round((Date.now() / 1000 - data.fetchedAt) / 60))} 分钟前的数据 · ${escapeHtml(hint)}</p>` : "";
-  return `<div class="claude-quota${data.stale ? " is-stale" : ""}">${head}
-    <div class="quota-grid">${shown.map(([label, item]) => quotaWindowCell(label, item)).join("")}</div>
+  return `<div class="card-quota${data.stale ? " is-stale" : ""}" role="group" aria-label="Claude 订阅额度">
+    <div class="quota-grid">${shown.map(([label, item]) => quotaCell("Claude", label, item.remainingPercent, item.resetsAt)).join("")}</div>
     ${extra ? `<p class="token-note">${extra}</p>` : ""}${age}
   </div>`;
 }
@@ -660,7 +694,7 @@ function renderClaudeUsage(): string {
   if (!monitoring.claude) return renderMonitorOff("claude");
   if (isTauri && data && !data.sourceAvailable) {
     return `<section class="token-card claude-card" aria-label="Claude 用量">
-      <div class="token-card-head"><div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div>${sourceSwitch("claude")}</div>
+      <div class="token-card-head"><div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div></div>
       <p class="token-note">尚未发现本机 Claude Code 记录</p>
     </section>`;
   }
@@ -668,33 +702,33 @@ function renderClaudeUsage(): string {
   const block = data?.currentBlock ?? null;
   const session = data?.currentSession ?? null;
   const today = data?.today;
+  // With real subscription windows above, the locally estimated window needs no time bar of its own.
+  const showBlockClock = Boolean(block) && !monitoring.claudeQuota;
   const blockProgress = block ? clampPercent(((Date.now() / 1000) - block.startedAt) / (block.resetsAt - block.startedAt) * 100) : 0;
   // Cache reads dominate Claude totals (often >95%), so the headline counts input + output only.
   const io = (value: ClaudeTokenBreakdown | null | undefined) => value ? value.inputTokens + value.outputTokens : undefined;
   const note = !data
     ? "正在读取本机 Claude Code 记录"
-    : block
-      ? `${formatClaudeReset(block.resetsAt)} · 不含缓存`
-      : "当前没有活跃的 5 小时窗口 · 数字不含缓存";
+    : !block
+      ? "当前没有活跃的 5 小时窗口 · Token 数不含缓存"
+      : showBlockClock
+        ? `本机估算窗口 ${formatReset(block.resetsAt)} · Token 数不含缓存`
+        : "Token 数为输入加输出，不含缓存";
   const row = (label: string, key: keyof ClaudeTokenBreakdown) =>
     `<tr${key === "totalTokens" ? ' class="token-total-row"' : ""}><th scope="row">${label}</th>${renderTokenTableCell(block?.[key], available && Boolean(block))}${renderTokenTableCell(today?.[key], available)}${renderTokenTableCell(session?.[key], available && Boolean(session))}</tr>`;
+  const plan = monitoring.claudeQuota && claudeQuota?.plan ? escapeHtml(formatPlan(claudeQuota.plan)) : "";
   return `
     <section class="token-card claude-card" aria-label="Claude 用量">
-      <div class="token-card-head">
-        <div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div>
-        <span class="caption-end"><button class="token-detail-button" data-action="claude-details" aria-expanded="${claudeDetailsOpen}" aria-controls="claude-details">
-          ${claudeDetailsOpen ? "收起" : "明细"}${icon("chevron")}
-        </button>${sourceSwitch("claude")}</span>
-      </div>
+      ${cardHead("claude", plan, claudeDetailsOpen)}
       ${renderClaudeQuota()}
       <div class="token-summary-grid" role="group" aria-label="Claude 用量摘要（输入加输出）">
         ${tokenStat("5 小时窗口", io(block), available && Boolean(block), Boolean(block))}
         ${tokenStat("今日累计", io(today), available)}
         ${tokenStat("当前会话", io(session), available && Boolean(session))}
       </div>
-      ${block ? `<div class="quota-track claude-window" role="progressbar" aria-label="5 小时窗口已过时间" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${blockProgress}"><i style="width:${blockProgress}%"></i></div>` : ""}
+      ${showBlockClock ? `<div class="quota-track claude-window" role="progressbar" aria-label="5 小时窗口已过时间" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${blockProgress}"><i style="width:${blockProgress}%"></i></div>` : ""}
       ${claudeDetailsOpen ? `
-        <div class="token-details" id="claude-details">
+        <div class="token-details${detailsEntering === "claude" ? " is-entering" : ""}" id="claude-details">
           <table>
             <caption>Claude Token 分类明细</caption>
             <thead><tr><th scope="col">分类</th><th scope="col">5 小时</th><th scope="col">今日</th><th scope="col">会话</th></tr></thead>
@@ -721,13 +755,13 @@ function render(): void {
   app.innerHTML = `<div class="panel-shell">
     <section class="glass-card main-card" data-state="${state}" data-view="${view}" aria-label="Codex Meter">
       <header class="panel-header">
-        <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${settingsOpen ? "你的桌面，按你的习惯" : "Codex · Claude 用量"}</span></div></div>
+        <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${escapeHtml(headerSubtitle(freshness))}</span></div></div>
         <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
-        ${settingsOpen ? renderSettings() : `${monitoring.codex ? `${renderQuota()}${renderTokenUsage()}` : renderMonitorOff("codex")}${renderClaudeUsage()}`}
+        ${settingsOpen ? renderSettings() : `${monitoring.codex ? renderCodexCard() : renderMonitorOff("codex")}${renderClaudeUsage()}`}
       </div>
-      <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(statusCopy().detail)}">${icon(state === "ok" ? "check" : state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy())}</span></div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
+      <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(statusCopy().detail)}">${footerStatusCopy(freshness) ? `${icon(state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy(freshness))}</span>` : ""}</div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
   </div>`;
   if (!changedView) {
@@ -739,6 +773,7 @@ function render(): void {
     input?.focus({ preventScroll: true });
     if (selection && selection[0] !== null && selection[1] !== null) input?.setSelectionRange(selection[0], selection[1]);
   }
+  detailsEntering = null;
   observePanelSize();
   schedulePanelSync();
 }
@@ -772,7 +807,7 @@ function schedulePanelSync(): void {
     const bodyStyle = getComputedStyle(document.body);
     const width = Math.ceil(shell.offsetWidth + parseFloat(bodyStyle.paddingLeft) + parseFloat(bodyStyle.paddingRight));
     const scroll = shell.querySelector<HTMLElement>(".panel-scroll");
-    const hiddenContent = scroll ? Math.max(0, Math.min(scroll.scrollHeight, 600) - scroll.clientHeight) : 0;
+    const hiddenContent = scroll ? Math.max(0, Math.min(scroll.scrollHeight, 680) - scroll.clientHeight) : 0;
     const height = Math.ceil(shell.offsetHeight + hiddenContent + parseFloat(bodyStyle.paddingTop) + parseFloat(bodyStyle.paddingBottom));
     applyPanelPosition();
     const nextSize = `${width}x${height}`;
@@ -947,13 +982,18 @@ interface TrayRing {
 
 interface TrayPresentation {
   mood: CatMood;
-  /** Outer ring is the 5-hour window, inner ring the weekly one; missing windows draw no ring. */
-  rings: TrayRing[];
+  /** One ring around the cat for the window that matters right now; null draws only the track. */
+  ring: TrayRing | null;
   dimmed: boolean;
   alertDot: boolean;
   /** Native menu bar text on macOS; empty hides it. */
   title: string;
   tooltip: string;
+}
+
+interface TrayWindow {
+  minutes: number;
+  remaining: number;
 }
 
 const TRAY_IDLE_COLOR = "#7890aa";
@@ -967,38 +1007,76 @@ function shortWindow(minutes: number): string {
   return `${minutes}分`;
 }
 
-function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
+function trayMood(lowest: number, exhausted: boolean): CatMood {
+  if (lowest === 0 && exhausted) return "exhausted";
+  return lowest >= 50 ? "healthy" : lowest >= 20 ? "warning" : "critical";
+}
+
+/**
+ * Picks the window the ring and the menu bar text both show. The first (5-hour) window is the
+ * one that moves; another takes over only once it is both tighter and actually running low.
+ */
+function trayReadout(windows: TrayWindow[]): { ring: TrayRing; title: string; detail: string; lowest: number } {
+  const first = windows[0];
+  const tightest = windows.reduce((low, item) => item.remaining < low.remaining ? item : low);
+  const shown = tightest !== first && tightest.remaining < WEEKLY_TITLE_BELOW ? tightest : first;
+  const lightSurface = runtimePlatform === "macos" && !themeQuery.matches;
+  return {
+    ring: { remaining: shown.remaining, color: usageColor(shown.remaining, lightSurface) },
+    title: shown === first ? `${shown.remaining}%` : `${shortWindow(shown.minutes)} ${shown.remaining}%`,
+    detail: windows.map(item => `${formatWindow(item.minutes)} ${item.remaining}%`).join(" · "),
+    lowest: tightest.remaining,
+  };
+}
+
+function codexTray(data: UsageSnapshot | null): TrayPresentation {
   if (!monitoring.codex) {
-    return { mood: "sleeping", rings: [], dimmed: true, alertDot: false, title: "", tooltip: "Codex 额度监测已关闭" };
+    return { mood: "sleeping", ring: null, dimmed: true, alertDot: false, title: "", tooltip: "Codex 额度监测已关闭" };
   }
-  const windows = [data?.primary, data?.secondary].filter(Boolean) as LimitWindow[];
+  const windows = ([data?.primary, data?.secondary].filter(Boolean) as LimitWindow[])
+    .map(item => ({ minutes: item.windowDurationMins, remaining: remainingOf(item) }));
   const freshness = dataFreshness();
   if (!data || !windows.length) {
     const unavailable = freshness === "unavailable";
     return {
-      mood: "neutral", rings: [], dimmed: true, alertDot: unavailable,
+      mood: "neutral", ring: null, dimmed: true, alertDot: unavailable,
       title: unavailable ? "—" : "…",
       tooltip: unavailable ? "Codex 暂时无法获取用量" : "Codex 正在获取用量",
     };
   }
-
-  const rings = windows.map(item => ({ remaining: remainingOf(item), color: usageColor(remainingOf(item)) }));
-  const tightest = tightestWindow(data)!;
-  const lowest = remainingOf(tightest);
-  // The 5-hour number is the one that moves. Name another window only once it is both the
-  // tighter one and actually running low; the inner ring already shows it otherwise.
-  const binding = windows.length > 1 && tightest !== windows[0] && lowest < remainingOf(windows[0]) && lowest < WEEKLY_TITLE_BELOW;
-  const title = binding ? `${shortWindow(tightest.windowDurationMins)} ${lowest}%` : `${remainingOf(windows[0])}%`;
-  const detail = windows.map(item => `${formatWindow(item.windowDurationMins)} ${remainingOf(item)}%`).join(" · ");
-
+  const { ring, title, detail, lowest } = trayReadout(windows);
   if (freshness === "expired") {
-    return { mood: "sleeping", rings, dimmed: true, alertDot: true, title, tooltip: `Codex 数据已过期 · ${detail}` };
+    return { mood: "sleeping", ring, dimmed: true, alertDot: true, title, tooltip: `Codex 数据已过期 · ${detail}` };
   }
-  const mood: CatMood = lowest === 0 && data.status === "limit_reached"
-    ? "exhausted"
-    : lowest >= 50 ? "healthy" : lowest >= 20 ? "warning" : "critical";
   const prefix = freshness === "reconnecting" ? "Codex 正在重连" : "Codex 剩余";
-  return { mood, rings, dimmed: false, alertDot: false, title, tooltip: `${prefix} · ${detail}` };
+  return { mood: trayMood(lowest, data.status === "limit_reached"), ring, dimmed: false, alertDot: false, title, tooltip: `${prefix} · ${detail}` };
+}
+
+function claudeTray(): TrayPresentation {
+  const quota = claudeQuota;
+  const windows = ([[300, quota?.fiveHour], [10080, quota?.sevenDay]] as Array<[number, ClaudeQuotaWindow | null | undefined]>)
+    .filter((entry): entry is [number, ClaudeQuotaWindow] => Boolean(entry[1]))
+    .map(([minutes, item]) => ({ minutes, remaining: clampPercent(item.remainingPercent) }));
+  if (!quota || !windows.length) {
+    return {
+      mood: "neutral", ring: null, dimmed: true, alertDot: Boolean(quota),
+      title: quota ? "—" : "…",
+      tooltip: quota ? "Claude 订阅额度暂时无法获取" : "Claude 正在查询订阅额度",
+    };
+  }
+  const { ring, title, detail, lowest } = trayReadout(windows);
+  const prefix = quota.stale ? "Claude 正在重连" : "Claude 剩余";
+  return { mood: trayMood(lowest, true), ring, dimmed: false, alertDot: false, title, tooltip: `${prefix} · ${detail}` };
+}
+
+/** The chosen source drives the ring, cat and menu bar text; the other one is appended to the tooltip. */
+function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
+  if (activeTraySource() === "claude") {
+    const presentation = claudeTray();
+    return monitoring.codex ? { ...presentation, tooltip: `${presentation.tooltip}\n${codexTray(data).tooltip}` } : presentation;
+  }
+  const presentation = codexTray(data);
+  return { ...presentation, tooltip: presentation.tooltip + claudeTooltip() };
 }
 
 function drawCatFace(context: CanvasRenderingContext2D, mood: CatMood): void {
@@ -1161,31 +1239,28 @@ function drawTrayArtwork(context: CanvasRenderingContext2D, presentation: TrayPr
     context.fill();
   }
 
-  // Two concentric rings: outer = 5-hour window, inner = weekly window. Each fills clockwise
-  // from 12 o'clock with what remains, so a full ring means plenty left.
+  // One thick ring around the cat. It fills clockwise from 12 o'clock with what remains,
+  // so a full ring means plenty left.
   const onGlass = !isMacOS || darkMode;
-  const track = onGlass ? "rgba(231, 248, 255, .2)" : "rgba(10, 31, 47, .16)";
-  const radii: Array<[number, number]> = [[28.5, 5], [21.5, 4.5]];
-  radii.forEach(([radius, width], index) => {
-    const ring = presentation.rings[index];
-    context.lineWidth = width;
-    context.lineCap = "round";
-    context.beginPath();
-    context.arc(32, 32, radius, 0, Math.PI * 2);
-    context.strokeStyle = track;
-    context.stroke();
-    if (!ring || ring.remaining <= 0) return;
-    context.beginPath();
+  context.lineWidth = 8;
+  context.lineCap = "round";
+  context.beginPath();
+  context.arc(32, 32, 27.5, 0, Math.PI * 2);
+  context.strokeStyle = onGlass ? "rgba(231, 248, 255, .24)" : "rgba(10, 31, 47, .2)";
+  context.stroke();
+  const ring = presentation.ring;
+  if (ring && ring.remaining > 0) {
     const start = -Math.PI / 2;
-    context.arc(32, 32, radius, start, start + Math.PI * 2 * Math.min(1, ring.remaining / 100));
+    context.beginPath();
+    context.arc(32, 32, 27.5, start, start + Math.PI * 2 * Math.min(1, ring.remaining / 100));
     context.strokeStyle = presentation.dimmed ? TRAY_IDLE_COLOR : ring.color;
     context.stroke();
-  });
+  }
 
-  // The cat avatar sits inside the inner ring.
+  // The cat avatar fills the inside of the ring.
   context.save();
   context.translate(32, 33.5);
-  context.scale(.74, .74);
+  context.scale(.9, .9);
   context.translate(-32, -27);
   if (presentation.dimmed) context.globalAlpha = .72;
   drawCatFace(context, presentation.mood);
@@ -1211,7 +1286,7 @@ async function updateTrayIcon(data: UsageSnapshot | null): Promise<void> {
   if (!isTauri || !trayPlatformReady) return;
   const pixels = runtimePlatform === "macos" ? TRAY_PIXELS.macos : TRAY_PIXELS.windows;
   const presentation = trayPresentation(data);
-  const tooltip = presentation.tooltip + claudeTooltip();
+  const tooltip = presentation.tooltip;
   // Background events arrive every few seconds; skip the IPC when nothing visible changed.
   const trayKey = JSON.stringify([presentation, tooltip, themeQuery.matches, runtimePlatform]);
   if (trayKey === lastTrayKey) return;
@@ -1251,13 +1326,27 @@ app.addEventListener("click", async (event) => {
       break;
     case "claude-details":
       claudeDetailsOpen = !claudeDetailsOpen;
+      // One table at a time keeps the panel inside its height without scrolling.
+      if (claudeDetailsOpen) { tokenDetailsOpen = false; detailsEntering = "claude"; }
       render();
       app.querySelector<HTMLButtonElement>('[data-action="claude-details"]')?.focus();
       break;
     case "token-details":
       tokenDetailsOpen = !tokenDetailsOpen;
+      if (tokenDetailsOpen) { claudeDetailsOpen = false; detailsEntering = "token"; }
       render();
       app.querySelector<HTMLButtonElement>('[data-action="token-details"]')?.focus();
+      break;
+    case "tray-source":
+      trayPreference = button.dataset.value === "claude" ? "claude" : "codex";
+      try {
+        localStorage.setItem(TRAY_SOURCE_KEY, trayPreference);
+      } catch {
+        // The choice still applies until the app restarts.
+      }
+      render();
+      app.querySelector<HTMLButtonElement>(`[data-action="tray-source"][data-value="${trayPreference}"]`)?.focus();
+      void updateTrayIcon(snapshot);
       break;
     case "settings":
       settingsOpen = !settingsOpen;
@@ -1352,6 +1441,8 @@ window.setInterval(() => {
     void updateTrayIcon(snapshot);
     return;
   }
+  const subtitle = app.querySelector<HTMLElement>(".brand-subtitle");
+  if (subtitle) subtitle.textContent = headerSubtitle(freshness);
   const updated = app.querySelector<HTMLElement>(".updated span");
   if (updated && !refreshing) {
     updated.textContent = footerStatusCopy(freshness);

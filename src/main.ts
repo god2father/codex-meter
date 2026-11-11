@@ -26,6 +26,8 @@ interface ClaudeQuotaSnapshot {
   sevenDaySonnet: ClaudeQuotaWindow | null;
   fetchedAt: number;
   message: string | null;
+  /** Front-end only: windows are from an earlier successful read. */
+  stale?: boolean;
 }
 
 function escapeHtml(value: string): string {
@@ -614,7 +616,7 @@ function formatClaudeReset(unixSeconds: number): string {
 const CLAUDE_QUOTA_HINT: Record<ClaudeQuotaSnapshot["status"], string> = {
   ok: "",
   no_credentials: "未找到 Claude Code 登录。在终端安装并登录 claude 命令行后会自动读取。",
-  expired: "Claude Code 登录已过期。在终端运行一次 claude 即可自动续期。",
+  expired: "Claude Code 登录正在续期或续期失败，Meter 会自动重试；持续出现时在终端运行一次 claude。",
   unauthorized: "Claude Code 登录已失效，请在终端重新登录 claude。",
   rate_limited: "查询过于频繁，稍后自动重试。",
   error: "暂时无法获取 Claude 订阅额度。",
@@ -642,12 +644,14 @@ function renderClaudeQuota(): string {
     .map(([label, item]) => `${label}剩余 ${clampPercent(item.remainingPercent)}%`).join(" · ");
   const head = `<div class="section-caption"><span>订阅额度</span><span class="caption-end"><span>${data?.plan ? escapeHtml(formatPlan(data.plan)) : ""}</span>${sourceSwitch("claudeQuota")}</span></div>`;
   if (!data) return `<div class="claude-quota">${head}<p class="token-note">正在查询 Claude 订阅额度…</p></div>`;
-  if (data.status !== "ok" || !shown.length) {
-    return `<div class="claude-quota">${head}<p class="token-note claude-quota-hint">${escapeHtml(CLAUDE_QUOTA_HINT[data.status] || data.message || "")}</p></div>`;
+  const hint = data.status !== "ok" ? CLAUDE_QUOTA_HINT[data.status] || data.message || "" : "";
+  if (!shown.length) {
+    return `<div class="claude-quota">${head}<p class="token-note claude-quota-hint">${escapeHtml(hint)}</p></div>`;
   }
-  return `<div class="claude-quota">${head}
+  const age = data.stale ? `<p class="token-note claude-quota-hint">显示 ${Math.max(1, Math.round((Date.now() / 1000 - data.fetchedAt) / 60))} 分钟前的数据 · ${escapeHtml(hint)}</p>` : "";
+  return `<div class="claude-quota${data.stale ? " is-stale" : ""}">${head}
     <div class="quota-grid">${shown.map(([label, item]) => quotaWindowCell(label, item)).join("")}</div>
-    ${extra ? `<p class="token-note">${extra}</p>` : ""}
+    ${extra ? `<p class="token-note">${extra}</p>` : ""}${age}
   </div>`;
 }
 
@@ -923,7 +927,7 @@ function applyCodexSnapshot(next: UsageSnapshot): void {
 
 function claudeTooltip(): string {
   if (!monitoring.claude) return "";
-  const quota = monitoring.claudeQuota && claudeQuota?.status === "ok" ? claudeQuota : null;
+  const quota = monitoring.claudeQuota && claudeQuota && (claudeQuota.status === "ok" || claudeQuota.stale) ? claudeQuota : null;
   if (quota && (quota.fiveHour || quota.sevenDay)) {
     const parts = ([["5 小时", quota.fiveHour], ["每周", quota.sevenDay]] as Array<[string, ClaudeQuotaWindow | null]>)
       .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]))
@@ -1312,7 +1316,10 @@ if (isTauri) {
   });
   void listen<ClaudeQuotaSnapshot>("usage://claude-quota", ({ payload }) => {
     if (!monitoring.claudeQuota || !monitoring.claude) return;
-    claudeQuota = payload;
+    // A failed refresh keeps the last good windows on screen, marked stale, instead of blanking them.
+    claudeQuota = payload.status !== "ok" && claudeQuota && (claudeQuota.fiveHour || claudeQuota.sevenDay)
+      ? { ...claudeQuota, status: payload.status, message: payload.message, stale: true }
+      : { ...payload, stale: false };
     render();
     void updateTrayIcon(snapshot);
   });

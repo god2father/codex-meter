@@ -325,7 +325,7 @@ fn claude_roots() -> Vec<PathBuf> {
             return roots;
         }
     }
-    let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) else {
+    let Some(home) = home_dir() else {
         return Vec::new();
     };
     let home = PathBuf::from(home);
@@ -361,6 +361,19 @@ fn collect_jsonl_files(directory: &Path, cutoff: i64, output: &mut Vec<(PathBuf,
             }
         }
     }
+}
+
+/// The home folder the way Claude Code (Node's `os.homedir()`) resolves it: `USERPROFILE` on
+/// Windows, where a shell's `HOME` can point elsewhere, and `HOME` everywhere else.
+pub fn home_dir() -> Option<std::ffi::OsString> {
+    let ordered = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    ordered
+        .into_iter()
+        .find_map(|name| env::var_os(name).filter(|value| !value.is_empty()))
 }
 
 pub fn unix_now() -> i64 {

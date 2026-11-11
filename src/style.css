@@ -270,3 +270,4 @@ html[data-native-glass="liquid"] .brand-subtitle { color: #fff; }
 .claude-quota--off { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 11px; color: var(--muted); }
 .claude-quota--off small { display: block; margin-top: 2px; font-size: 11px; color: var(--subtle); }
 .claude-quota-hint { color: var(--warning); }
+.claude-quota.is-stale .quota-window { opacity: .62; }

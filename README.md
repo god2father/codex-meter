@@ -23,7 +23,7 @@ Windows 版本已验证生产构建、单实例、右键菜单、深色模式、
 
 - 显示 Codex 5 小时和每周用量窗口。
 - 显示本机 Claude Code 用量：当前 5 小时窗口、今日累计、当前会话和按模型汇总（主数字为输入加输出，不含缓存）。
-- 可选的 Claude 订阅额度（5 小时与每周，含 Opus/Sonnet 每周窗口）：开启后只读 Claude Code 自己的登录凭据（macOS 钥匙串项 `Claude Code-credentials`，或 `~/.claude/.credentials.json`），向 Claude Code `/usage` 使用的同一接口查询，每 5 分钟一次（面板打开时 2 分钟）。Meter 不刷新、不写入、不上传凭据；需要先在终端安装并登录 `claude` 命令行。该接口未公开文档，可能变化。
+- 可选的 Claude 订阅额度（5 小时与每周，含 Opus/Sonnet 每周窗口）：开启后使用 Claude Code 自己的登录凭据（macOS 钥匙串项 `Claude Code-credentials`，或 `~/.claude/.credentials.json`），向 Claude Code `/usage` 使用的同一接口查询，每 5 分钟一次（面板打开时 2 分钟）。访问令牌约 3 小时过期，Meter 会按 Claude Code 相同的方式自动续期：先取得 `~/.claude/.oauth_refresh.lock` 续期锁、在锁内重新读取凭据，再写回同一钥匙串项，保留其余字段；凭据不会上传到 Anthropic 以外的地方。需要先在终端安装并登录 `claude` 命令行；网络请求遵循 macOS 系统代理。该接口未公开文档，可能变化。
 - Codex 与 Claude 各有一个监测开关，可在卡片右上角或设置页切换；关闭的来源不再刷新、不占用后台进程。Codex 默认开启，Claude 默认关闭，设置重启后保留。
 - Windows 托盘只显示方形玻璃小猫，通过表情和耳朵姿态表达用量状态。
 - macOS 菜单栏将玻璃小猫与进度条左右排列，同时表达状态和剩余额度。

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { listen } from "@tauri-apps/api/event";
 import {
   disable as disableAutostart,
@@ -220,6 +221,7 @@ let freshnessExpiryTimer = 0;
 let lastTrayKey = "";
 let trayPreference: TraySource = loadTrayPreference();
 let exitArmed = false;
+let appVersion = "";
 let exitArmTimer = 0;
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -382,7 +384,7 @@ function footerStatusCopy(freshness = dataFreshness()): string {
 
 /** Line under the title: how fresh the numbers are, for whichever source is being watched. */
 function headerSubtitle(freshness = dataFreshness()): string {
-  if (settingsOpen) return "你的桌面，按你的习惯";
+  if (settingsOpen) return appVersion ? `版本 ${appVersion}` : "监测来源与托盘";
   if (monitoring.codex) return freshness === "fresh" && snapshot ? formatUpdated(snapshot.fetchedAt) : "Codex · Claude 用量";
   if (!monitoring.claude) return "Codex · Claude 用量";
   const fetchedAt = (monitoring.claudeQuota ? claudeQuota?.fetchedAt : undefined) ?? claudeSnapshot?.fetchedAt;
@@ -534,11 +536,15 @@ function renderMonitorOff(source: UsageSource): string {
 }
 
 /** One remaining-quota column: label, big percentage, bar and reset time. */
-function quotaCell(source: string, label: string, remaining: number, resetsAt: number | null): string {
+function quotaCell(source: string, label: string, remaining: number, resetsAt: number | null, windowMinutes: number): string {
   const value = clampPercent(remaining);
+  // Tick at the share of the window's time still ahead: a fill reaching past it means the
+  // quota is lasting longer than the clock, a fill short of it means it is being spent faster.
+  const timeLeft = resetsAt === null ? null : (resetsAt - Date.now() / 1000) / (windowMinutes * 60) * 100;
+  const pace = timeLeft !== null && timeLeft > 0 && timeLeft <= 100 ? Math.round(timeLeft) : null;
   return `<div class="quota-window" data-tone="${usageTone(value)}">
     <div class="quota-heading"><span>${label}</span><strong>${value}<small>%</small></strong></div>
-    <div class="quota-track" role="meter" aria-label="${source} ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"><i style="width:${value}%"></i></div>
+    <div class="quota-track" role="meter" aria-label="${source} ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"${pace !== null ? ` title="额度剩 ${value}%，窗口时间剩 ${pace}%"` : ""}><i style="width:${value}%"></i>${pace !== null ? `<b class="quota-pace" style="left:${pace}%" aria-hidden="true"></b>` : ""}</div>
     <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
   </div>`;
 }
@@ -562,7 +568,7 @@ function renderSettings(): string {
       ${traySources().length > 1 ? `<div class="setting-row"><span class="setting-label"><i>${icon("app")}</i><span class="setting-copy"><span>托盘显示</span><small>圆环与小猫跟随所选来源</small></span></span><div class="segmented" role="radiogroup" aria-label="托盘显示来源">${(["codex", "claude"] as TraySource[]).map(source => `<button role="radio" aria-checked="${activeTraySource() === source}" data-action="tray-source" data-value="${source}">${source === "codex" ? "Codex" : "Claude"}</button>`).join("")}</div></div>` : ""}
     </div>
     ${autostartError ? `<p class="inline-error" role="alert">${escapeHtml(autostartError)}</p>` : ""}
-    <p class="setting-note">外观跟随系统。Codex 额度在后台每分钟刷新，面板打开时每 30 秒；Token 统计每 10–30 秒。</p>
+    <p class="setting-note">外观跟随系统。Codex 额度每 30–60 秒刷新，Token 统计每 10–30 秒，Claude 订阅额度每 2–5 分钟。</p>
     <div class="section-caption settings-caption"><span>监测</span></div>
     <div class="settings-group">
       ${(["codex", "claude", "claudeQuota"] as UsageSource[]).map(source => {
@@ -570,7 +576,7 @@ function renderSettings(): string {
         const hint = source === "codex" ? "订阅额度与本机 Codex Token"
           : source === "claude" ? "本机 ~/.claude 记录中的 Token"
           : blocked ? "需先开启 Claude 用量监测" : "用 Claude Code 的登录查询 5 小时与每周额度";
-        return `<label class="setting-row setting-toggle"><span class="setting-label"><i>${icon(source === "codex" ? "app" : source === "claude" ? "spark" : "clock")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${hint}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] && !blocked ? "checked" : ""} ${monitoringBusy === source || blocked ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
+        return `<label class="setting-row setting-toggle${source === "claudeQuota" ? " setting-row--child" : ""}"><span class="setting-label"><i>${icon(source === "codex" ? "app" : source === "claude" ? "spark" : "clock")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${hint}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] && !blocked ? "checked" : ""} ${monitoringBusy === source || blocked ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
       }).join("")}
     </div>
     ${monitoringError ? `<p class="inline-error" role="alert">${escapeHtml(monitoringError)}</p>` : ""}
@@ -627,7 +633,7 @@ function renderCodexCard(): string {
       ${cardHead("codex", plan, tokenDetailsOpen)}
       <div class="card-quota" role="group" aria-label="Codex 剩余额度">
         ${windows.length
-          ? `<div class="quota-grid">${windows.map(item => quotaCell("Codex", formatWindow(item.windowDurationMins), remainingOf(item), item.resetsAt)).join("")}</div>`
+          ? `<div class="quota-grid">${windows.map(item => quotaCell("Codex", formatWindow(item.windowDurationMins), remainingOf(item), item.resetsAt, item.windowDurationMins)).join("")}</div>`
           : `<div class="quota-empty">${icon(loading ? "clock" : "alert")}<span>${escapeHtml(statusCopy().label)}</span><button class="text-button" data-action="refresh" ${refreshing ? "disabled" : ""}>重试</button></div>`}
       </div>
       <div class="token-summary-grid" role="group" aria-label="Codex Token 摘要">
@@ -673,8 +679,8 @@ function renderClaudeQuota(): string {
   }
   const data = claudeQuota;
   if (!data) return `<div class="card-quota"><p class="token-note">正在查询 Claude 订阅额度…</p></div>`;
-  const shown = ([["5 小时", data.fiveHour], ["每周", data.sevenDay]] as Array<[string, ClaudeQuotaWindow | null]>)
-    .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]));
+  const shown = ([["5 小时", data.fiveHour, 300], ["每周", data.sevenDay, 10080]] as Array<[string, ClaudeQuotaWindow | null, number]>)
+    .filter((entry): entry is [string, ClaudeQuotaWindow, number] => Boolean(entry[1]));
   const extra = ([["Opus 每周", data.sevenDayOpus], ["Sonnet 每周", data.sevenDaySonnet]] as Array<[string, ClaudeQuotaWindow | null]>)
     .filter((entry): entry is [string, ClaudeQuotaWindow] => Boolean(entry[1]))
     .map(([label, item]) => `${label}剩余 ${clampPercent(item.remainingPercent)}%`).join(" · ");
@@ -684,7 +690,7 @@ function renderClaudeQuota(): string {
   }
   const age = data.stale ? `<p class="token-note claude-quota-hint">显示 ${Math.max(1, Math.round((Date.now() / 1000 - data.fetchedAt) / 60))} 分钟前的数据 · ${escapeHtml(hint)}</p>` : "";
   return `<div class="card-quota${data.stale ? " is-stale" : ""}" role="group" aria-label="Claude 订阅额度">
-    <div class="quota-grid">${shown.map(([label, item]) => quotaCell("Claude", label, item.remainingPercent, item.resetsAt)).join("")}</div>
+    <div class="quota-grid">${shown.map(([label, item, minutes]) => quotaCell("Claude", label, item.remainingPercent, item.resetsAt, minutes)).join("")}</div>
     ${extra ? `<p class="token-note">${extra}</p>` : ""}${age}
   </div>`;
 }
@@ -1383,7 +1389,15 @@ if (isTauri) {
   void loadMonitoring();
   document.addEventListener("contextmenu", (event) => event.preventDefault());
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") void invoke("hide_panel").catch(() => undefined);
+    if (event.key !== "Escape") return;
+    // Escape steps back out of settings first; a second press closes the panel.
+    if (settingsOpen) {
+      settingsOpen = false;
+      render();
+      app.querySelector<HTMLButtonElement>('[data-action="settings"]')?.focus();
+      return;
+    }
+    void invoke("hide_panel").catch(() => undefined);
   });
   // The Rust scheduler owns the refresh cadence so updates keep flowing while the panel is hidden.
   void listen<UsageSnapshot>("usage://codex", ({ payload }) => {
@@ -1428,6 +1442,10 @@ if (isTauri) {
     applyPanelPosition();
   });
   void initializeAutostart();
+  void getVersion().then((version) => {
+    appVersion = version;
+    if (settingsOpen) render();
+  }).catch(() => undefined);
   // The scheduler fetches quota on its first tick; only make sure local stats use our timezone.
   void initializeRuntimePlatform().then(() => requestBackgroundRefresh(false));
 } else {

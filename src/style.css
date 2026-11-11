@@ -80,8 +80,9 @@ h1 { font-size: 17px; line-height: 1.3; letter-spacing: -.55px; font-weight: 680
 .quota-heading > span { font-size: 11px; color: var(--muted); }
 .quota-heading strong { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -.8px; }
 .quota-heading small { font-size: 11px; margin-left: 1px; color: var(--muted); letter-spacing: 0; }
-.quota-track { overflow: hidden; height: 4px; margin: 6px 0 7px; border-radius: 4px; background: var(--track); }
+.quota-track { position: relative; height: 4px; margin: 6px 0 7px; border-radius: 4px; background: var(--track); }
 .quota-track i { display: block; height: 100%; border-radius: inherit; background: var(--ok-fill); transition: width .5s var(--ease); }
+.quota-pace { position: absolute; top: -3px; width: 2px; height: 10px; margin-left: -1px; border-radius: 1px; background: var(--text); opacity: .6; }
 [data-tone="warning"] .quota-track i { background: var(--warn-fill); }
 [data-tone="critical"] .quota-track i { background: var(--crit-fill); }
 [data-tone="warning"] .quota-heading strong { color: var(--warn-fill); }
@@ -142,6 +143,8 @@ h1 { font-size: 17px; line-height: 1.3; letter-spacing: -.55px; font-weight: 680
 .setting-row { min-height: 49px; gap: 10px; justify-content: space-between; padding: 11px 12px; font-size: 12px; }
 .setting-row + .setting-row { border-top: 1px solid var(--line); }
 .setting-label { gap: 9px; min-width: 0; }
+.setting-row--child .setting-label { padding-left: 27px; }
+.setting-row--child .setting-label > i { display: none; }
 .setting-label > i { display: grid; place-items: center; color: var(--muted); font-style: normal; }
 .setting-label svg { width: 18px; height: 18px; }
 .setting-value { color: var(--muted); font-size: 11px; }

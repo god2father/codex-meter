@@ -1,6 +1,6 @@
 # Codex Meter
 
-Codex Meter 是一款面向 Windows 系统托盘和 macOS 菜单栏的轻量用量查看工具，可分别开启 Codex 额度监测和 Claude Code 用量监测。
+Codex Meter 是一款面向 Windows 系统托盘和 macOS 菜单栏的轻量用量查看工具，可分别开启 Codex 额度监测、Claude Code 用量监测与 Antigravity 额度监测。
 
 它通过本机官方 `codex app-server` 读取当前 ChatGPT 账户的用量窗口，并使用平台适配的玻璃小猫状态图标与轻薄玻璃气泡面板展示剩余额度、重置时间和套餐类型。
 
@@ -24,7 +24,8 @@ Windows 版本已验证生产构建、单实例、右键菜单、深色模式、
 - 显示 Codex 5 小时和每周用量窗口。
 - 显示本机 Claude Code 用量：当前 5 小时窗口、今日累计、当前会话和按模型汇总（主数字为输入加输出，不含缓存）。
 - 可选的 Claude 订阅额度（5 小时与每周，含 Opus/Sonnet 每周窗口）：开启后使用 Claude Code 自己的登录凭据（macOS 钥匙串项 `Claude Code-credentials`，或 `~/.claude/.credentials.json`），向 Claude Code `/usage` 使用的同一接口查询，每 5 分钟一次（面板打开时 2 分钟）。访问令牌约 3 小时过期，Meter 会按 Claude Code 相同的方式自动续期：先取得 `~/.claude/.oauth_refresh.lock` 续期锁、在锁内重新读取凭据，再写回同一钥匙串项，保留其余字段；凭据不会上传到 Anthropic 以外的地方。需要先在终端安装并登录 `claude` 命令行；网络请求遵循 macOS 系统代理。该接口未公开文档，可能变化。
-- Codex 与 Claude 各有一个监测开关，可在卡片右上角或设置页切换；关闭的来源不再刷新、不占用后台进程。Codex 默认开启，Claude 默认关闭，设置重启后保留。
+- 可选的 Antigravity 额度监测：默认关闭，开启后通过本机运行中的 Antigravity `language_server`（发现文件 `~/.gemini/antigravity/daemon/*.json`）向本地回环 ConnectRPC `GetUserStatus` 只读查询当前登录账户的剩余额度与重置时间（绕过系统代理，不触发模型推理）。支持按共享额度池分组展示（如 Gemini 共享池与 Claude / GPT 合作模型共享池）及展开查看各基础模型明细，并可作为单环托盘来源；当存在多个配额分组时，托盘单环以剩余比例最低的分组为准。
+- Codex、Claude 与 Antigravity 各有独立的监测开关，可在卡片右上角或设置页切换；关闭的来源不再刷新、不占用后台进程。Codex 默认开启，Claude 与 Antigravity 默认关闭，设置重启后保留（兼容旧版 `monitoring.json`）。
 - Windows 托盘只显示方形玻璃小猫，通过表情和耳朵姿态表达用量状态。
 - macOS 菜单栏将玻璃小猫与进度条左右排列，同时表达状态和剩余额度。
 - 小猫采用深蓝玻璃本体、霓虹状态轮廓、高光大眼和极简嘴型。
@@ -33,7 +34,7 @@ Windows 版本已验证生产构建、单实例、右键菜单、深色模式、
 - 接口支持时展示账户当前可用的额度重置次数。
 - 根据剩余用量显示不同的轻松提示文案。
 - 自动识别 Plus、Pro、Team、Business 等套餐名称。
-- 后台线程负责刷新，面板收起时托盘也会更新：Codex 额度每分钟（面板打开时每 30 秒），本机 Token 每 10–30 秒；打开面板、睡眠唤醒后立即刷新，也可手动刷新。
+- 后台线程负责刷新，面板收起时托盘也会更新：Codex 与 Antigravity 额度每分钟（面板打开时每 30 秒），本机 Token 每 10–30 秒，Claude 订阅额度每 5 分钟（面板打开时每 2 分钟）；打开面板、睡眠唤醒后立即刷新，也可手动刷新。
 - 可在设置中开启“随系统登录启动”，默认关闭。
 - 刷新失败时保留最后一次成功结果并标记为旧数据。
 - 5 分钟内的短暂失败显示“正在重连”，超过 5 分钟才进入数据过期状态。
@@ -67,12 +68,19 @@ initialize
 - 套餐类型优先采用实时 rate limits 响应，避免显示过期账户信息。
 - `resetsAt` 按 Unix 秒解析，并使用系统时区显示。
 - Token 摘要来自本机 Codex 会话文件中的独立 `token_count` 事件，通过累计值差分计算最近一轮、今日累计和当前会话。
+- Antigravity 额度来自本机运行中的 Antigravity `language_server`（`~/.gemini/antigravity/daemon/*.json`）本地回环 `POST /exa.language_server_pb.LanguageServerService/GetUserStatus`：
+  - 直接读取 `cascadeModelConfigData.clientModelConfigs[*].quotaInfo.remainingFraction`（`0.0`–`1.0`，转换为剩余百分比）与 `resetTime`（ISO-8601 UTC 时间戳，按本地时区显示）。
+  - 接口不返回窗口时长，因此不套用 Codex/Claude 的 5 小时或每周窗口与时间进度刻度；若某模型缺少 `remainingFraction`，界面显示未知（`—`），不会猜测为 `0%` 或 `100%`。
+  - 仅在同厂商大类且 `remainingFraction` 与 `resetTime` 精确一致时合并为共享额度分组，不同配额自动拆开显示，不做无依据平均。
+  - 套餐名优先取 `userTier.name` / `description`（如 `Google AI Pro`）；仅在返回明确 `creditAmount` 时显示 `AI Credits`，不混用遗留 `availablePromptCredits` 占位字段。
+  - 可通过环境变量 `CODEX_METER_ANTIGRAVITY_DAEMON_DIR` 指定自定义的 daemon 发现目录。
 
 ## 隐私与安全边界
 
 - 不读取或复制 `~/.codex/auth.json`。
 - 用量统计读取 `~/.codex/sessions` 和 `~/.codex/archived_sessions` 时只解析相关事件的类型、时间戳和 token 数字，不解析或保存提示词、回复与代码内容。
 - 开启 Claude 监测后，只读取 `~/.claude/projects`（或 `CLAUDE_CONFIG_DIR`）下 Claude Code 记录中 assistant 消息的 usage 数字、时间戳、模型名和会话 ID，不保存对话内容；不读取 Claude 登录凭据。
+- 开启 Antigravity 监测后，仅向本机回环 `127.0.0.1` 的 Antigravity `language_server` 发送只读状态查询，不提取浏览器 Cookie、不修改登录态、不触发模型推理；CSRF 令牌与账号邮箱/姓名仅限后端内存使用，不会传入前端、日志或缓存。
 - 不保存 OpenAI access token、refresh token 或浏览器 Cookie。
 - 不直接调用未公开的 `chatgpt.com/backend-api/wham/usage`。
 - 登录和令牌刷新完全交给用户已安装的 Codex CLI/App Server。
@@ -166,7 +174,8 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 ## 已知限制
 
-- macOS 尚未真机打包和视觉验收。
+- Antigravity 集成依赖未公开的本地 `language_server` ConnectRPC 协议与 `~/.gemini/antigravity/daemon/*.json` 发现文件（已实测于 macOS Antigravity `2.34.0`），未来版本若调整协议或发现路径可能需要适配；仅在 Antigravity 应用运行时可获取实时额度，关闭应用后显示未运行/过期提示。
+- Windows 和 Intel Mac 环境下的 Antigravity 发现与托盘表现尚未实机验证。
 - Windows 原生 Acrylic 在部分 WebView2 环境可能导致灰屏，目前默认使用稳定的 CSS 轻玻璃方案。
 - Windows 安装包仍需完成签名和更多 DPI、多显示器测试。
 - macOS App Store 版本需要重新评估私有透明窗口 API。

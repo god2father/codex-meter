@@ -14,8 +14,49 @@ type DataFreshness = "fresh" | "reconnecting" | "expired" | "loading" | "unavail
 type CatMood = "healthy" | "warning" | "critical" | "exhausted" | "sleeping" | "neutral";
 type RuntimePlatform = "windows" | "macos" | "other";
 
-type UsageSource = "codex" | "claude" | "claudeQuota";
-interface Monitoring { codex: boolean; claude: boolean; claudeQuota: boolean }
+type UsageSource = "codex" | "claude" | "claudeQuota" | "antigravity";
+interface Monitoring { codex: boolean; claude: boolean; claudeQuota: boolean; antigravity: boolean }
+
+type AntigravityStatus =
+  | "ok"
+  | "limit_reached"
+  | "not_installed"
+  | "not_running"
+  | "signed_out"
+  | "no_data"
+  | "rate_limited"
+  | "error";
+
+interface AntigravityModelQuota {
+  label: string;
+  modelId: string | null;
+  remainingPercent: number | null;
+  usedPercent: number | null;
+  resetsAt: number | null;
+}
+
+interface AntigravityQuotaGroup {
+  id: string;
+  label: string;
+  remainingPercent: number | null;
+  usedPercent: number | null;
+  resetsAt: number | null;
+  models: string[];
+  modelCount: number;
+}
+
+interface AntigravitySnapshot {
+  status: AntigravityStatus;
+  plan: string | null;
+  aiCredits: number | null;
+  version: string | null;
+  groups: AntigravityQuotaGroup[];
+  models: AntigravityModelQuota[];
+  fetchedAt: number;
+  message: string | null;
+  /** Front-end only: groups/models are from an earlier successful read. */
+  stale?: boolean;
+}
 
 interface ClaudeQuotaWindow { usedPercent: number; remainingPercent: number; resetsAt: number | null }
 interface ClaudeQuotaSnapshot {
@@ -179,9 +220,45 @@ const mockClaudeSnapshot: ClaudeUsageSnapshot = {
   fetchedAt: Math.floor(Date.now() / 1000),
 };
 
+const mockAntigravitySnapshot: AntigravitySnapshot = {
+  status: "ok",
+  plan: "Google AI Pro",
+  aiCredits: null,
+  version: "2.34.0",
+  groups: [
+    {
+      id: "group-1",
+      label: "Gemini",
+      remainingPercent: 84,
+      usedPercent: 16,
+      resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600,
+      models: ["Gemini 4 Neon", "Gemini 4 Carbon", "Gemini 4 Argon", "Gemini 4 Hydrogen", "Gemini 3.8 Flash"],
+      modelCount: 20,
+    },
+    {
+      id: "group-2",
+      label: "Claude/GPT",
+      remainingPercent: 100,
+      usedPercent: 0,
+      resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600,
+      models: ["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"],
+      modelCount: 7,
+    },
+  ],
+  models: [
+    { label: "Gemini 4 Neon", modelId: "gemini-4-neon-high", remainingPercent: 84, usedPercent: 16, resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600 },
+    { label: "Gemini 3.8 Flash", modelId: "gemini-3.8-flash-high", remainingPercent: 84, usedPercent: 16, resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600 },
+    { label: "Claude Opus 5.5", modelId: "claude-opus-5-5-high", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
+    { label: "Claude Sonnet 5.5", modelId: "claude-sonnet-5-5-high", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
+    { label: "GPT-OSS 120B", modelId: "gpt-oss-120b-medium", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
+  ],
+  fetchedAt: Math.floor(Date.now() / 1000),
+  message: null,
+};
+
 const CACHE_KEY = "codex-meter:last-usage";
 const TRAY_SOURCE_KEY = "codex-meter:tray-source";
-type TraySource = "codex" | "claude";
+type TraySource = "codex" | "claude" | "antigravity";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
 let snapshot: UsageSnapshot | null = isTauri ? loadCachedSnapshot() : mockSnapshot;
@@ -200,10 +277,16 @@ let claudeQuota: ClaudeQuotaSnapshot | null = isTauri ? null : {
   sevenDayOpus: { usedPercent: 44, remainingPercent: 56, resetsAt: Math.floor(Date.now() / 1000) + 2.5 * 86400 },
 };
 let claudeDetailsOpen = false;
+let antigravitySnapshot: AntigravitySnapshot | null = isTauri ? null : mockAntigravitySnapshot;
+let antigravityRefreshing = false;
+let antigravityDetailsOpen = false;
+let lastAntigravityExpired = false;
 /** Set for the one render that opens a details table, so background refreshes do not replay its fade-in. */
-let detailsEntering: "token" | "claude" | null = null;
-// Matches the backend default until monitoring_status answers; the browser preview shows both.
-let monitoring: Monitoring = isTauri ? { codex: true, claude: false, claudeQuota: false } : { codex: true, claude: true, claudeQuota: true };
+let detailsEntering: "token" | "claude" | "antigravity" | null = null;
+// Matches the backend default until monitoring_status answers; the browser preview shows all sources.
+let monitoring: Monitoring = isTauri
+  ? { codex: true, claude: false, claudeQuota: false, antigravity: false }
+  : { codex: true, claude: true, claudeQuota: true, antigravity: true };
 let monitoringBusy: UsageSource | null = null;
 let monitoringError = "";
 let lastView = "";
@@ -369,8 +452,22 @@ function statusCopy(freshness = dataFreshness()): { label: string; detail: strin
   return { label: "状态良好", detail: "Codex 额度已同步" };
 }
 
+function antigravityAgeSeconds(data: AntigravitySnapshot): number {
+  return Math.max(0, Math.floor(Date.now() / 1000) - data.fetchedAt);
+}
+
+function antigravityIsExpired(data: AntigravitySnapshot | null): boolean {
+  return Boolean(data && data.groups.length > 0 && antigravityAgeSeconds(data) >= STALE_AFTER_SECONDS);
+}
+
 function footerStatusCopy(freshness = dataFreshness()): string {
-  if (!monitoring.codex) return monitoring.claude ? "仅监测 Claude Code" : "监测已全部关闭";
+  if (!monitoring.codex) {
+    const active = [
+      monitoring.claude ? "Claude Code" : "",
+      monitoring.antigravity ? "Antigravity" : "",
+    ].filter(Boolean);
+    return active.length ? `仅监测 ${active.join(" · ")}` : "监测已全部关闭";
+  }
   if (freshness === "fresh" && snapshot) return snapshot.status === "limit_reached" ? "Codex 额度已用尽，等待重置" : "";
   if (freshness === "reconnecting" && snapshot) {
     const action = refreshing && !errorMessage ? "正在同步" : "正在重连";
@@ -385,36 +482,51 @@ function footerStatusCopy(freshness = dataFreshness()): string {
 /** Line under the title: how fresh the numbers are, for whichever source is being watched. */
 function headerSubtitle(freshness = dataFreshness()): string {
   if (settingsOpen) return appVersion ? `版本 ${appVersion}` : "监测来源与托盘";
-  if (monitoring.codex) return freshness === "fresh" && snapshot ? formatUpdated(snapshot.fetchedAt) : "Codex · Claude 用量";
-  if (!monitoring.claude) return "Codex · Claude 用量";
-  const fetchedAt = (monitoring.claudeQuota ? claudeQuota?.fetchedAt : undefined) ?? claudeSnapshot?.fetchedAt;
-  return fetchedAt ? formatUpdated(fetchedAt) : "Codex · Claude 用量";
+  const fallback = "Codex · Claude · Antigravity";
+  if (monitoring.codex) return freshness === "fresh" && snapshot ? formatUpdated(snapshot.fetchedAt) : fallback;
+  const fetchedAt = [
+    monitoring.claude && monitoring.claudeQuota ? claudeQuota?.fetchedAt : undefined,
+    monitoring.claude ? claudeSnapshot?.fetchedAt : undefined,
+    monitoring.antigravity && antigravitySnapshot?.groups.length ? antigravitySnapshot.fetchedAt : undefined,
+  ].filter((value): value is number => typeof value === "number" && value > 0);
+  return fetchedAt.length ? formatUpdated(Math.max(...fetchedAt)) : fallback;
 }
 
 function scheduleFreshnessExpiry(): void {
   window.clearTimeout(freshnessExpiryTimer);
-  if (!hasUsage(snapshot)) return;
-  const remainingSeconds = STALE_AFTER_SECONDS - snapshotAgeSeconds(snapshot);
-  if (remainingSeconds <= 0) return;
+  const candidates: number[] = [];
+  if (hasUsage(snapshot)) {
+    const remaining = STALE_AFTER_SECONDS - snapshotAgeSeconds(snapshot);
+    if (remaining > 0) candidates.push(remaining);
+  }
+  if (monitoring.antigravity && antigravitySnapshot && antigravitySnapshot.groups.length > 0) {
+    const remaining = STALE_AFTER_SECONDS - antigravityAgeSeconds(antigravitySnapshot);
+    if (remaining > 0) candidates.push(remaining);
+  }
+  if (!candidates.length) return;
+  const nextSeconds = Math.min(...candidates);
   freshnessExpiryTimer = window.setTimeout(() => {
     render();
     void updateTrayIcon(snapshot);
-  }, remainingSeconds * 1000 + 50);
+  }, nextSeconds * 1000 + 50);
 }
 
 function loadTrayPreference(): TraySource {
   try {
-    return localStorage.getItem(TRAY_SOURCE_KEY) === "claude" ? "claude" : "codex";
+    const saved = localStorage.getItem(TRAY_SOURCE_KEY);
+    if (saved === "claude" || saved === "antigravity") return saved;
+    return "codex";
   } catch {
     return "codex";
   }
 }
 
-/** Sources able to drive the tray ring. Claude needs its subscription windows; token counts have no percentage. */
+/** Sources able to drive the tray ring. Token-only views have no reliable quota percentage. */
 function traySources(): TraySource[] {
   const sources: TraySource[] = [];
   if (monitoring.codex) sources.push("codex");
   if (monitoring.claude && monitoring.claudeQuota) sources.push("claude");
+  if (monitoring.antigravity) sources.push("antigravity");
   return sources;
 }
 
@@ -489,7 +601,7 @@ async function setAutostart(enabled: boolean): Promise<void> {
   }
 }
 
-function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens" | "device" | "link" | "arrow" | "back" | "chevron" | "laptop"): string {
+function icon(name: "chevronRight" | "spark" | "orbit" | "refresh" | "settings" | "exit" | "clock" | "check" | "alert" | "app" | "shield" | "close" | "moon" | "power" | "tokens" | "device" | "link" | "arrow" | "back" | "chevron" | "laptop"): string {
   const paths = {
     device: '<rect x="6" y="2.5" width="12" height="19" rx="3"/><path d="M9 6h6M10 17h4"/>',
     link: '<path d="m10 13 4-4M8 16l-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M16 8l1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0"/>',
@@ -498,6 +610,7 @@ function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" |
     chevron: '<path d="m8 10 4 4 4-4"/>',
     chevronRight: '<path d="m10 8 4 4-4 4"/>',
     spark: '<path d="M12 3.5v17M4.6 7.75l14.8 8.5M4.6 16.25l14.8-8.5"/>',
+    orbit: '<path d="M6.2 18.2 12 4.5l5.8 13.7"/><path d="M4.5 14.8c2.4-2.5 5-3.6 7.5-3.6s5.1 1.1 7.5 3.6"/>',
     laptop: '<rect x="4" y="4" width="16" height="12" rx="2"/><path d="M2 20h20M9 16l-1 4m7-4 1 4"/>',
     refresh: '<path d="M20 11a8.1 8.1 0 1 0 .1 4M20 4v7h-7"/>',
     settings: '<path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
@@ -515,72 +628,108 @@ function icon(name: "chevronRight" | "spark" | "refresh" | "settings" | "exit" |
   return `<svg aria-hidden="true" viewBox="0 0 24 24">${paths[name]}</svg>`;
 }
 
-const SOURCE_LABEL: Record<UsageSource, string> = { codex: "Codex 额度监测", claude: "Claude 用量监测", claudeQuota: "Claude 订阅额度" };
+const SOURCE_LABEL: Record<UsageSource, string> = {
+  codex: "Codex 额度监测",
+  claude: "Claude 用量监测",
+  claudeQuota: "Claude 订阅额度",
+  antigravity: "Antigravity 额度监测",
+};
+
+const TRAY_SOURCE_LABEL: Record<TraySource, string> = {
+  codex: "Codex",
+  claude: "Claude",
+  antigravity: "Antigravity",
+};
 
 function sourceSwitch(source: UsageSource): string {
   const busy = monitoringBusy === source;
   return `<label class="setting-toggle source-switch" title="${monitoring[source] ? "关闭" : "开启"}${SOURCE_LABEL[source]}"><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] ? "checked" : ""} ${busy ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
 }
 
-function renderMonitorOff(source: UsageSource): string {
-  const [title, mark, copy] = source === "codex"
-    ? ["Codex", icon("app"), "额度与 Token 监测已关闭，不会启动 Codex 后台服务。"]
-    : ["Claude Code", icon("spark"), "开启后读取本机 Claude Code 记录中的 Token 数字，不读取对话内容。"];
-  return `<section class="token-card monitor-off${source === "claude" ? " claude-card" : ""}" aria-label="${title} 监测已关闭">
+function renderMonitorOff(source: "codex" | "claude" | "antigravity"): string {
+  const [title, mark, copy, cardClass, markClass] = source === "codex"
+    ? ["Codex", icon("app"), "额度与 Token 监测已关闭，不会启动 Codex 后台服务。", "", ""]
+    : source === "claude"
+      ? ["Claude Code", icon("spark"), "开启后读取本机 Claude Code 记录中的 Token 数字，不读取对话内容。", " claude-card", " claude-mark"]
+      : ["Antigravity", icon("orbit"), "开启后从本机 Antigravity 后台服务读取模型剩余额度与重置时间。", " antigravity-card", " antigravity-mark"];
+  return `<section class="token-card monitor-off${cardClass}" aria-label="${title} 监测已关闭">
     <div class="token-card-head">
-      <div><span class="token-mark${source === "claude" ? " claude-mark" : ""}">${mark}</span><strong>${title}</strong></div>
+      <div><span class="token-mark${markClass}">${mark}</span><strong>${title}</strong></div>
       ${sourceSwitch(source)}
     </div>
     <p class="token-note">${copy}</p>
   </section>`;
 }
 
-/** One remaining-quota column: label, big percentage, bar and reset time. */
-function quotaCell(source: string, label: string, remaining: number, resetsAt: number | null, windowMinutes: number): string {
+/** One remaining-quota column: label, big percentage (or — when unknown), bar and reset time. */
+function quotaCell(
+  source: string,
+  label: string,
+  remaining: number | null,
+  resetsAt: number | null,
+  windowMinutes: number | null,
+  headingTitle = "",
+): string {
+  const safeLabel = escapeHtml(label);
+  if (remaining === null || !Number.isFinite(remaining)) {
+    return `<div class="quota-window" data-tone="unknown">
+      <div class="quota-heading"><span${headingTitle ? ` title="${escapeHtml(headingTitle)}"` : ""}>${safeLabel}</span><strong aria-label="${escapeHtml(source)} ${safeLabel}剩余未知">—</strong></div>
+      <div class="quota-track" aria-hidden="true"></div>
+      <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
+    </div>`;
+  }
   const value = clampPercent(remaining);
   // Tick at the share of the window's time still ahead: a fill reaching past it means the
   // quota is lasting longer than the clock, a fill short of it means it is being spent faster.
-  const timeLeft = resetsAt === null ? null : (resetsAt - Date.now() / 1000) / (windowMinutes * 60) * 100;
+  const timeLeft = resetsAt === null || windowMinutes === null || windowMinutes <= 0
+    ? null
+    : (resetsAt - Date.now() / 1000) / (windowMinutes * 60) * 100;
   const pace = timeLeft !== null && timeLeft > 0 && timeLeft <= 100 ? Math.round(timeLeft) : null;
   return `<div class="quota-window" data-tone="${usageTone(value)}">
-    <div class="quota-heading"><span>${label}</span><strong>${value}<small>%</small></strong></div>
-    <div class="quota-track" role="meter" aria-label="${source} ${label}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"${pace !== null ? ` title="额度剩 ${value}%，窗口时间剩 ${pace}%"` : ""}><i style="width:${value}%"></i>${pace !== null ? `<b class="quota-pace" style="left:${pace}%" aria-hidden="true"></b>` : ""}</div>
+    <div class="quota-heading"><span${headingTitle ? ` title="${escapeHtml(headingTitle)}"` : ""}>${safeLabel}</span><strong>${value}<small>%</small></strong></div>
+    <div class="quota-track" role="meter" aria-label="${escapeHtml(source)} ${safeLabel}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"${pace !== null ? ` title="额度剩 ${value}%，窗口时间剩 ${pace}%"` : ""}><i style="width:${value}%"></i>${pace !== null ? `<b class="quota-pace" style="left:${pace}%" aria-hidden="true"></b>` : ""}</div>
     <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
   </div>`;
 }
 
-/** Shared card header: source mark and name, plan, and the details toggle. */
-function cardHead(source: "codex" | "claude", plan: string, open: boolean): string {
+/** Shared card header: source mark and name, plan, and optional details toggle. */
+function cardHead(source: "codex" | "claude" | "antigravity", plan: string, open: boolean, showDetails = true): string {
   const [name, mark, action, controls] = source === "codex"
     ? ["Codex", `<span class="token-mark">${icon("app")}</span>`, "token-details", "token-details"]
-    : ["Claude Code", `<span class="token-mark claude-mark">${icon("spark")}</span>`, "claude-details", "claude-details"];
+    : source === "claude"
+      ? ["Claude Code", `<span class="token-mark claude-mark">${icon("spark")}</span>`, "claude-details", "claude-details"]
+      : ["Antigravity", `<span class="token-mark antigravity-mark">${icon("orbit")}</span>`, "antigravity-details", "antigravity-details"];
   return `<div class="token-card-head">
     <div>${mark}<strong>${name}</strong>${plan ? `<span class="card-plan">${plan}</span>` : ""}</div>
-    <button class="token-detail-button" data-action="${action}" aria-expanded="${open}" aria-controls="${controls}">${open ? "收起" : "明细"}${icon("chevron")}</button>
+    ${showDetails ? `<button class="token-detail-button" data-action="${action}" aria-expanded="${open}" aria-controls="${controls}">${open ? "收起" : "明细"}${icon("chevron")}</button>` : ""}
   </div>`;
 }
 
 function renderSettings(): string {
+  const availableTraySources = traySources();
   return `<section id="settings-card" class="settings-content" aria-label="偏好设置">
     <div class="section-caption"><span>通用</span></div>
     <div class="settings-group">
       <label class="setting-row setting-toggle"><span class="setting-label"><i>${icon("power")}</i><span class="setting-copy"><span>登录时启动</span><small>自动驻留托盘</small></span></span><input type="checkbox" data-setting="autostart" aria-label="登录时启动" ${autostartEnabled ? "checked" : ""} ${autostartLoading || !isTauri ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>
-      ${traySources().length > 1 ? `<div class="setting-row"><span class="setting-label"><i>${icon("app")}</i><span class="setting-copy"><span>托盘显示</span><small>圆环与小猫跟随所选来源</small></span></span><div class="segmented" role="radiogroup" aria-label="托盘显示来源">${(["codex", "claude"] as TraySource[]).map(source => `<button role="radio" aria-checked="${activeTraySource() === source}" data-action="tray-source" data-value="${source}">${source === "codex" ? "Codex" : "Claude"}</button>`).join("")}</div></div>` : ""}
+      ${availableTraySources.length > 1 ? `<div class="setting-row${availableTraySources.length > 2 ? " setting-row--stacked" : ""}"><span class="setting-label"><i>${icon("app")}</i><span class="setting-copy"><span>托盘显示</span><small>圆环与小猫跟随所选来源</small></span></span><div class="segmented" role="radiogroup" aria-label="托盘显示来源">${availableTraySources.map(source => `<button role="radio" aria-checked="${activeTraySource() === source}" data-action="tray-source" data-value="${source}">${TRAY_SOURCE_LABEL[source]}</button>`).join("")}</div></div>` : ""}
     </div>
     ${autostartError ? `<p class="inline-error" role="alert">${escapeHtml(autostartError)}</p>` : ""}
-    <p class="setting-note">外观跟随系统。Codex 额度每 30–60 秒刷新，Token 统计每 10–30 秒，Claude 订阅额度每 2–5 分钟。</p>
+    <p class="setting-note">外观跟随系统。Codex 与 Antigravity 额度每 30–60 秒刷新，Token 统计每 10–30 秒，Claude 订阅额度每 2–5 分钟。</p>
     <div class="section-caption settings-caption"><span>监测</span></div>
     <div class="settings-group">
-      ${(["codex", "claude", "claudeQuota"] as UsageSource[]).map(source => {
+      ${(["codex", "claude", "claudeQuota", "antigravity"] as UsageSource[]).map(source => {
         const blocked = source === "claudeQuota" && !monitoring.claude;
         const hint = source === "codex" ? "订阅额度与本机 Codex Token"
           : source === "claude" ? "本机 ~/.claude 记录中的 Token"
-          : blocked ? "需先开启 Claude 用量监测" : "用 Claude Code 的登录查询 5 小时与每周额度";
-        return `<label class="setting-row setting-toggle${source === "claudeQuota" ? " setting-row--child" : ""}"><span class="setting-label"><i>${icon(source === "codex" ? "app" : source === "claude" ? "spark" : "clock")}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${hint}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] && !blocked ? "checked" : ""} ${monitoringBusy === source || blocked ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
+          : source === "claudeQuota"
+            ? (blocked ? "需先开启 Claude 用量监测" : "用 Claude Code 的登录查询 5 小时与每周额度")
+            : "读取本机 Antigravity 后台服务的模型剩余额度";
+        const iconName = source === "codex" ? "app" : source === "claude" ? "spark" : source === "claudeQuota" ? "clock" : "orbit";
+        return `<label class="setting-row setting-toggle${source === "claudeQuota" ? " setting-row--child" : ""}"><span class="setting-label"><i>${icon(iconName)}</i><span class="setting-copy"><span>${SOURCE_LABEL[source]}</span><small>${hint}</small></span></span><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] && !blocked ? "checked" : ""} ${monitoringBusy === source || blocked ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
       }).join("")}
     </div>
     ${monitoringError ? `<p class="inline-error" role="alert">${escapeHtml(monitoringError)}</p>` : ""}
-    <p class="settings-footnote">只读取本机记录里的 Token 数字，不读取对话内容。关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
+    <p class="settings-footnote">仅读取本机统计数字与本地服务额度状态，不读取对话内容。关闭的来源不再刷新，也不会占用后台资源；设置会在重启后保留。</p>
   </section>`;
 }
 
@@ -746,13 +895,102 @@ function renderClaudeUsage(): string {
     </section>`;
 }
 
+const ANTIGRAVITY_STATUS_HINT: Record<AntigravityStatus, string> = {
+  ok: "",
+  limit_reached: "所有已知模型分组额度已用尽，等待重置。",
+  not_installed: "未检测到本机 Antigravity，请先安装并登录。",
+  not_running: "Antigravity 未运行，打开应用后会自动同步额度。",
+  signed_out: "Antigravity 尚未登录，请先在应用中登录账号。",
+  no_data: "当前账号暂未返回可用模型额度数据。",
+  rate_limited: "查询过于频繁，稍后自动重试。",
+  error: "暂时无法获取 Antigravity 额度。",
+};
+
+function renderAntigravityCard(): string {
+  if (!monitoring.antigravity) return renderMonitorOff("antigravity");
+  const data = antigravitySnapshot;
+  const planParts = [
+    data?.plan ? escapeHtml(data.plan) : "",
+    data?.aiCredits != null ? `AI Credits ${formatTokenSummary(data.aiCredits)}` : "",
+  ].filter(Boolean);
+  const plan = planParts.join(" · ");
+  const hasModels = Boolean(data && data.models.length > 0);
+
+  if (!data) {
+    return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+      ${cardHead("antigravity", plan, false, false)}
+      <div class="card-quota card-quota--standalone">
+        <div class="quota-empty">${icon("clock")}<span>正在连接本机 Antigravity…</span></div>
+      </div>
+    </section>`;
+  }
+
+  const expired = antigravityIsExpired(data);
+  const stale = Boolean(data.stale) || expired;
+  const hint = data.status !== "ok" ? (data.message || ANTIGRAVITY_STATUS_HINT[data.status]) : "";
+
+  if (!data.groups.length) {
+    const canRetry = data.status === "not_running" || data.status === "error" || data.status === "no_data";
+    return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+      ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
+      <div class="card-quota card-quota--standalone">
+        <div class="quota-empty">
+          ${icon(antigravityRefreshing ? "clock" : "alert")}
+          <span>${escapeHtml(hint || "暂无可用额度数据")}</span>
+          ${canRetry ? `<button class="text-button" data-action="antigravity-refresh" ${antigravityRefreshing ? "disabled" : ""}>重试</button>` : ""}
+        </div>
+      </div>
+    </section>`;
+  }
+
+  const ageMinutes = Math.max(1, Math.floor(antigravityAgeSeconds(data) / 60));
+  const staleBanner = expired
+    ? `<p class="token-note claude-quota-hint" role="status">数据已过期 · 上次成功更新于 ${ageMinutes} 分钟前${hint ? ` · ${escapeHtml(hint)}` : ""}</p>`
+    : data.stale
+      ? `<p class="token-note claude-quota-hint" role="status">显示 ${ageMinutes} 分钟前的数据${hint ? ` · ${escapeHtml(hint)}` : ""}</p>`
+      : "";
+  const footerNote = antigravityRefreshing
+    ? "正在刷新本机 Antigravity 额度…"
+    : `${formatUpdated(data.fetchedAt)} · ${data.groups.length > 1 ? `${data.groups.length} 个共享额度分组` : "共享额度分组"}`;
+
+  return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+    ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
+    <div class="card-quota card-quota--standalone${stale ? " is-stale" : ""}" role="group" aria-label="Antigravity 剩余额度">
+      <div class="quota-grid">${data.groups.map(group => {
+        const modelsTitle = group.models.length > 1 ? `共享分组：${group.models.join("、")}` : group.label;
+        return quotaCell("Antigravity", group.label, group.remainingPercent, group.resetsAt, null, modelsTitle);
+      }).join("")}</div>
+      ${staleBanner}
+    </div>
+    ${antigravityDetailsOpen && hasModels ? `
+      <div class="token-details antigravity-details${detailsEntering === "antigravity" ? " is-entering" : ""}" id="antigravity-details">
+        <table>
+          <caption>Antigravity 模型额度明细</caption>
+          <thead><tr><th scope="col">模型</th><th scope="col">剩余</th><th scope="col">重置</th></tr></thead>
+          <tbody>
+            ${data.models.map(item => {
+              const remText = item.remainingPercent !== null && Number.isFinite(item.remainingPercent)
+                ? `${clampPercent(item.remainingPercent)}%`
+                : "—";
+              const resetText = item.resetsAt !== null ? formatReset(item.resetsAt).replace(/重置$/, "").trim() : "未知";
+              return `<tr><th scope="row" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</th><td>${remText}</td><td title="${escapeHtml(formatResetExact(item.resetsAt))}">${escapeHtml(resetText)}</td></tr>`;
+            }).join("")}
+          </tbody>
+        </table>
+      </div>` : ""}
+    <p class="token-note" role="note">${escapeHtml(footerNote)}</p>
+  </section>`;
+}
+
 function render(): void {
   const freshness = dataFreshness();
+  const anyRefreshing = refreshing || antigravityRefreshing;
   const state = !monitoring.codex ? "paused" : freshness === "fresh" ? snapshot?.status === "limit_reached" ? "error" : "ok" : freshness;
   const view = settingsOpen ? "settings" : "home";
   const changedView = view !== lastView;
   lastView = view;
   lastRenderedFreshness = freshness;
+  lastAntigravityExpired = antigravityIsExpired(antigravitySnapshot);
   scheduleFreshnessExpiry();
   const focused = document.activeElement instanceof HTMLInputElement ? document.activeElement : null;
   const focusId = focused?.id;
@@ -762,10 +1000,10 @@ function render(): void {
     <section class="glass-card main-card" data-state="${state}" data-view="${view}" aria-label="Codex Meter">
       <header class="panel-header">
         <div class="brand-line">${settingsOpen ? `<button class="icon-button back-button" data-action="settings" aria-label="返回主页">${icon("back")}</button>` : `<span class="app-mark">${icon("app")}</span>`}<div><h1>${settingsOpen ? "偏好设置" : "Codex Meter"}</h1><span class="brand-subtitle">${escapeHtml(headerSubtitle(freshness))}</span></div></div>
-        <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${refreshing}" ${refreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
+        <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${anyRefreshing}" ${anyRefreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
-        ${settingsOpen ? renderSettings() : `${monitoring.codex ? renderCodexCard() : renderMonitorOff("codex")}${renderClaudeUsage()}`}
+        ${settingsOpen ? renderSettings() : `${monitoring.codex ? renderCodexCard() : renderMonitorOff("codex")}${renderClaudeUsage()}${renderAntigravityCard()}`}
       </div>
       <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(statusCopy().detail)}">${footerStatusCopy(freshness) ? `${icon(state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy(freshness))}</span>` : ""}</div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
@@ -864,8 +1102,10 @@ function applyTokenSnapshot(value: unknown): void {
 /** Asks the background scheduler for fresh local token stats (and quota when asked). */
 async function requestBackgroundRefresh(includeQuota: boolean): Promise<void> {
   if (!isTauri) {
-    tokenSnapshot = { ...mockTokenSnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
-    claudeSnapshot = { ...mockClaudeSnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
+    const now = Math.floor(Date.now() / 1000);
+    tokenSnapshot = { ...mockTokenSnapshot, fetchedAt: now };
+    claudeSnapshot = { ...mockClaudeSnapshot, fetchedAt: now };
+    antigravitySnapshot = { ...mockAntigravitySnapshot, fetchedAt: now };
     tokenError = "";
     render();
     return;
@@ -876,8 +1116,66 @@ async function requestBackgroundRefresh(includeQuota: boolean): Promise<void> {
   }).catch(() => undefined);
 }
 
+function applyAntigravitySnapshot(payload: AntigravitySnapshot): void {
+  const succeeded = (payload.status === "ok" || payload.status === "limit_reached") && payload.groups.length > 0;
+  if (succeeded) {
+    antigravitySnapshot = { ...payload, stale: false };
+    return;
+  }
+  // Signed-out or uninstalled states invalidate previous account readings; transient errors keep them marked stale.
+  if (payload.status === "signed_out" || payload.status === "not_installed") {
+    antigravitySnapshot = { ...payload, stale: false };
+    return;
+  }
+  if (antigravitySnapshot && antigravitySnapshot.groups.length > 0) {
+    antigravitySnapshot = {
+      ...antigravitySnapshot,
+      status: payload.status,
+      message: payload.message,
+      stale: true,
+    };
+  } else {
+    antigravitySnapshot = { ...payload, stale: false };
+  }
+}
+
+async function refreshAntigravity(): Promise<void> {
+  if (antigravityRefreshing || !monitoring.antigravity) return;
+  if (!isTauri) {
+    antigravitySnapshot = { ...mockAntigravitySnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
+    render();
+    await updateTrayIcon(snapshot);
+    return;
+  }
+  antigravityRefreshing = true;
+  render();
+  try {
+    const next = await invoke<AntigravitySnapshot>("refresh_antigravity");
+    applyAntigravitySnapshot(next);
+  } catch (error) {
+    applyAntigravitySnapshot({
+      status: "error",
+      plan: antigravitySnapshot?.plan ?? null,
+      aiCredits: antigravitySnapshot?.aiCredits ?? null,
+      version: antigravitySnapshot?.version ?? null,
+      groups: [],
+      models: [],
+      fetchedAt: Math.floor(Date.now() / 1000),
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    antigravityRefreshing = false;
+    render();
+    await updateTrayIcon(snapshot);
+  }
+}
+
 async function refreshAllUsage(): Promise<void> {
-  await Promise.all([monitoring.codex ? refreshUsage() : Promise.resolve(), requestBackgroundRefresh(false)]);
+  await Promise.all([
+    monitoring.codex ? refreshUsage() : Promise.resolve(),
+    monitoring.antigravity ? refreshAntigravity() : Promise.resolve(),
+    requestBackgroundRefresh(false),
+  ]);
 }
 
 async function loadMonitoring(): Promise<void> {
@@ -896,6 +1194,9 @@ async function setMonitoring(source: UsageSource, enabled: boolean): Promise<voi
   if (!isTauri) {
     // Browser preview has no backend; flip locally so both states can be inspected.
     monitoring = { ...monitoring, [source]: enabled };
+    if (source === "antigravity" && enabled && !antigravitySnapshot) {
+      antigravitySnapshot = { ...mockAntigravitySnapshot, fetchedAt: Math.floor(Date.now() / 1000) };
+    }
     render();
     return;
   }
@@ -910,6 +1211,7 @@ async function setMonitoring(source: UsageSource, enabled: boolean): Promise<voi
     }
     if (source === "claude" && !enabled) { claudeSnapshot = null; claudeQuota = null; }
     if (source === "claudeQuota" && !enabled) claudeQuota = null;
+    if (source === "antigravity" && !enabled) { antigravitySnapshot = null; antigravityDetailsOpen = false; }
     if (source === "codex" && !enabled) errorMessage = "";
   } catch (error) {
     monitoringError = error instanceof Error ? error.message : String(error);
@@ -1075,14 +1377,105 @@ function claudeTray(): TrayPresentation {
   return { mood: trayMood(lowest, true), ring, dimmed: false, alertDot: false, title, tooltip: `${prefix} · ${detail}` };
 }
 
-/** The chosen source drives the ring, cat and menu bar text; the other one is appended to the tooltip. */
+function antigravityTooltip(): string {
+  if (!monitoring.antigravity) return "";
+  const data = antigravitySnapshot;
+  if (!data) return "\nAntigravity · 正在获取用量";
+  const known = data.groups.filter(
+    (group): group is AntigravityQuotaGroup & { remainingPercent: number } =>
+      group.remainingPercent !== null && Number.isFinite(group.remainingPercent),
+  );
+  if (!known.length) {
+    return `\nAntigravity · ${data.message || ANTIGRAVITY_STATUS_HINT[data.status] || "暂无额度数据"}`;
+  }
+  const detail = known.map(group => `${group.label} ${clampPercent(group.remainingPercent)}%`).join(" · ");
+  if (antigravityIsExpired(data)) return `\nAntigravity 数据已过期 · ${detail}`;
+  return `\nAntigravity ${data.stale ? "正在重连" : "剩余"} · ${detail}`;
+}
+
+function shortAntigravityGroup(label: string): string {
+  if (label.startsWith("Gemini")) return "Gem";
+  if (label.startsWith("Claude")) return "Cld";
+  if (label.startsWith("GPT")) return "GPT";
+  return label.slice(0, 4);
+}
+
+/**
+ * Antigravity tray readout:
+ * - Only groups with a reliable numeric percentage can drive the ring.
+ * - With multiple groups, the lowest remaining percentage (tightest pool) drives the ring & cat mood.
+ */
+function antigravityTray(): TrayPresentation {
+  if (!monitoring.antigravity) {
+    return { mood: "sleeping", ring: null, dimmed: true, alertDot: false, title: "", tooltip: "Antigravity 额度监测已关闭" };
+  }
+  const data = antigravitySnapshot;
+  if (!data) {
+    return {
+      mood: "neutral", ring: null, dimmed: true, alertDot: false,
+      title: "…",
+      tooltip: "Antigravity 正在获取用量",
+    };
+  }
+  const known = data.groups
+    .filter((group): group is AntigravityQuotaGroup & { remainingPercent: number } =>
+      group.remainingPercent !== null && Number.isFinite(group.remainingPercent),
+    )
+    .map(group => ({ label: group.label, remaining: clampPercent(group.remainingPercent) }));
+
+  if (!known.length) {
+    const reason = data.message || ANTIGRAVITY_STATUS_HINT[data.status] || "暂时无法获取额度";
+    return {
+      mood: "neutral", ring: null, dimmed: true, alertDot: true,
+      title: "—",
+      tooltip: `Antigravity · ${reason}`,
+    };
+  }
+
+  const first = known[0];
+  const tightest = known.reduce((low, item) => item.remaining < low.remaining ? item : low);
+  const lightSurface = runtimePlatform === "macos" && !themeQuery.matches;
+  const ring: TrayRing = { remaining: tightest.remaining, color: usageColor(tightest.remaining, lightSurface) };
+  const title = known.length > 1 && tightest !== first
+    ? `${shortAntigravityGroup(tightest.label)} ${tightest.remaining}%`
+    : `${tightest.remaining}%`;
+  const detail = known.map(item => `${item.label} ${item.remaining}%`).join(" · ");
+
+  if (antigravityIsExpired(data)) {
+    return { mood: "sleeping", ring, dimmed: true, alertDot: true, title, tooltip: `Antigravity 数据已过期 · ${detail}` };
+  }
+  const prefix = data.stale ? "Antigravity 正在重连" : "Antigravity 剩余";
+  return {
+    mood: trayMood(tightest.remaining, data.status === "limit_reached"),
+    ring,
+    dimmed: Boolean(data.stale),
+    alertDot: Boolean(data.stale),
+    title,
+    tooltip: `${prefix} · ${detail}`,
+  };
+}
+
+/** The chosen source drives the ring, cat and menu bar text; the other enabled sources are appended to the tooltip. */
 function trayPresentation(data: UsageSnapshot | null): TrayPresentation {
-  if (activeTraySource() === "claude") {
+  const chosen = activeTraySource();
+  if (chosen === "claude") {
     const presentation = claudeTray();
-    return monitoring.codex ? { ...presentation, tooltip: `${presentation.tooltip}\n${codexTray(data).tooltip}` } : presentation;
+    const extras = [
+      monitoring.codex ? `\n${codexTray(data).tooltip}` : "",
+      antigravityTooltip(),
+    ].join("");
+    return { ...presentation, tooltip: presentation.tooltip + extras };
+  }
+  if (chosen === "antigravity") {
+    const presentation = antigravityTray();
+    const extras = [
+      monitoring.codex ? `\n${codexTray(data).tooltip}` : "",
+      claudeTooltip(),
+    ].join("");
+    return { ...presentation, tooltip: presentation.tooltip + extras };
   }
   const presentation = codexTray(data);
-  return { ...presentation, tooltip: presentation.tooltip + claudeTooltip() };
+  return { ...presentation, tooltip: presentation.tooltip + claudeTooltip() + antigravityTooltip() };
 }
 
 function drawCatFace(context: CanvasRenderingContext2D, mood: CatMood): void {
@@ -1330,21 +1723,34 @@ app.addEventListener("click", async (event) => {
     case "refresh":
       await refreshAllUsage();
       break;
+    case "antigravity-refresh":
+      await refreshAntigravity();
+      break;
     case "claude-details":
       claudeDetailsOpen = !claudeDetailsOpen;
       // One table at a time keeps the panel inside its height without scrolling.
-      if (claudeDetailsOpen) { tokenDetailsOpen = false; detailsEntering = "claude"; }
+      if (claudeDetailsOpen) { tokenDetailsOpen = false; antigravityDetailsOpen = false; detailsEntering = "claude"; }
       render();
       app.querySelector<HTMLButtonElement>('[data-action="claude-details"]')?.focus();
       break;
     case "token-details":
       tokenDetailsOpen = !tokenDetailsOpen;
-      if (tokenDetailsOpen) { claudeDetailsOpen = false; detailsEntering = "token"; }
+      if (tokenDetailsOpen) { claudeDetailsOpen = false; antigravityDetailsOpen = false; detailsEntering = "token"; }
       render();
       app.querySelector<HTMLButtonElement>('[data-action="token-details"]')?.focus();
       break;
+    case "antigravity-details":
+      antigravityDetailsOpen = !antigravityDetailsOpen;
+      if (antigravityDetailsOpen) { tokenDetailsOpen = false; claudeDetailsOpen = false; detailsEntering = "antigravity"; }
+      render();
+      app.querySelector<HTMLButtonElement>('[data-action="antigravity-details"]')?.focus();
+      break;
     case "tray-source":
-      trayPreference = button.dataset.value === "claude" ? "claude" : "codex";
+      trayPreference = button.dataset.value === "claude"
+        ? "claude"
+        : button.dataset.value === "antigravity"
+          ? "antigravity"
+          : "codex";
       try {
         localStorage.setItem(TRAY_SOURCE_KEY, trayPreference);
       } catch {
@@ -1385,20 +1791,21 @@ app.addEventListener("change", (event) => {
 
 render();
 
+document.addEventListener("keydown", (event) => {
+  if (event.key !== "Escape") return;
+  // Escape steps back out of settings first; a second press closes the panel in Tauri.
+  if (settingsOpen) {
+    settingsOpen = false;
+    render();
+    app.querySelector<HTMLButtonElement>('[data-action="settings"]')?.focus();
+    return;
+  }
+  if (isTauri) void invoke("hide_panel").catch(() => undefined);
+});
+
 if (isTauri) {
   void loadMonitoring();
   document.addEventListener("contextmenu", (event) => event.preventDefault());
-  document.addEventListener("keydown", (event) => {
-    if (event.key !== "Escape") return;
-    // Escape steps back out of settings first; a second press closes the panel.
-    if (settingsOpen) {
-      settingsOpen = false;
-      render();
-      app.querySelector<HTMLButtonElement>('[data-action="settings"]')?.focus();
-      return;
-    }
-    void invoke("hide_panel").catch(() => undefined);
-  });
   // The Rust scheduler owns the refresh cadence so updates keep flowing while the panel is hidden.
   void listen<UsageSnapshot>("usage://codex", ({ payload }) => {
     if (refreshing || !monitoring.codex) return;
@@ -1433,6 +1840,12 @@ if (isTauri) {
     render();
     if (hadClaude !== payload.sourceAvailable || payload.sourceAvailable) void updateTrayIcon(snapshot);
   });
+  void listen<AntigravitySnapshot>("usage://antigravity", ({ payload }) => {
+    if (!monitoring.antigravity || antigravityRefreshing) return;
+    applyAntigravitySnapshot(payload);
+    render();
+    void updateTrayIcon(snapshot);
+  });
   void listen("settings://open", () => {
     settingsOpen = true;
     render();
@@ -1454,7 +1867,8 @@ if (isTauri) {
 
 window.setInterval(() => {
   const freshness = dataFreshness();
-  if (freshness !== lastRenderedFreshness) {
+  const agyExpired = antigravityIsExpired(antigravitySnapshot);
+  if (freshness !== lastRenderedFreshness || agyExpired !== lastAntigravityExpired) {
     render();
     void updateTrayIcon(snapshot);
     return;
@@ -1464,6 +1878,9 @@ window.setInterval(() => {
   const updated = app.querySelector<HTMLElement>(".updated span");
   if (updated && !refreshing) {
     updated.textContent = footerStatusCopy(freshness);
+  }
+  if (monitoring.antigravity && antigravitySnapshot && !settingsOpen) {
+    render();
   }
 }, 30_000);
 

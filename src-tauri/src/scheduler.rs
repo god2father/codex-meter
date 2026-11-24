@@ -4,6 +4,7 @@
 //! snapshots to the webview as events.
 
 use crate::{
+    antigravity::{AntigravityService, AntigravitySnapshot},
     claude_quota::{ClaudeQuotaService, ClaudeQuotaSnapshot},
     claude_usage::{self, ClaudeUsageService},
     codex::{CodexService, UsageSnapshot},
@@ -46,6 +47,13 @@ pub const CLAUDE_QUOTA: Cadence = Cadence {
     retry: Duration::from_secs(300),
 };
 const CLAUDE_QUOTA_RATE_LIMITED: Duration = Duration::from_secs(600);
+/// Local loopback RPC to Antigravity's language_server.
+pub const ANTIGRAVITY_QUOTA: Cadence = Cadence {
+    visible: Duration::from_secs(30),
+    hidden: Duration::from_secs(60),
+    retry: Duration::from_secs(60),
+};
+const ANTIGRAVITY_RATE_LIMITED: Duration = Duration::from_secs(300);
 /// Opening the panel refetches quota when it is older than this.
 const SHOW_STALE_AFTER: Duration = Duration::from_secs(20);
 /// Wall clock moving this far ahead of the monotonic clock means the machine slept.
@@ -68,16 +76,19 @@ pub enum Source {
     Claude,
     /// Claude subscription windows, read with Claude Code's own login. Requires `Claude`.
     ClaudeQuota,
+    /// Local Antigravity desktop hub quota windows.
+    Antigravity,
 }
 
 /// Which sources are monitored. Codex keeps its previous always-on behaviour by default;
-/// Claude reads local transcripts, so it stays off until the user turns it on.
+/// Claude and Antigravity stay off until the user turns them on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Monitoring {
     pub codex: bool,
     pub claude: bool,
     pub claude_quota: bool,
+    pub antigravity: bool,
 }
 
 impl Default for Monitoring {
@@ -86,6 +97,7 @@ impl Default for Monitoring {
             codex: true,
             claude: false,
             claude_quota: false,
+            antigravity: false,
         }
     }
 }
@@ -98,6 +110,9 @@ struct Due {
     /// None means due now; checked on each local tick.
     claude_quota: Option<Instant>,
     last_claude_quota: Option<Instant>,
+    /// None means due now; checked on each local tick.
+    antigravity: Option<Instant>,
+    last_antigravity: Option<Instant>,
     wake: bool,
 }
 
@@ -105,10 +120,12 @@ pub struct UsageHub {
     pub codex: Arc<Mutex<CodexService>>,
     claude: Mutex<ClaudeUsageService>,
     claude_quota: Mutex<ClaudeQuotaService>,
+    antigravity: Mutex<AntigravityService>,
     offset_east_seconds: AtomicI64,
     codex_enabled: AtomicBool,
     claude_enabled: AtomicBool,
     claude_quota_enabled: AtomicBool,
+    antigravity_enabled: AtomicBool,
     preferences_path: Mutex<Option<PathBuf>>,
     due: Mutex<Due>,
     signal: Condvar,
@@ -120,10 +137,12 @@ impl UsageHub {
             codex: Arc::new(Mutex::new(CodexService::new())),
             claude: Mutex::new(ClaudeUsageService::new()),
             claude_quota: Mutex::new(ClaudeQuotaService::new()),
+            antigravity: Mutex::new(AntigravityService::new()),
             offset_east_seconds: AtomicI64::new(0),
             codex_enabled: AtomicBool::new(Monitoring::default().codex),
             claude_enabled: AtomicBool::new(Monitoring::default().claude),
             claude_quota_enabled: AtomicBool::new(Monitoring::default().claude_quota),
+            antigravity_enabled: AtomicBool::new(Monitoring::default().antigravity),
             preferences_path: Mutex::new(None),
             due: Mutex::new(Due::default()),
             signal: Condvar::new(),
@@ -135,6 +154,7 @@ impl UsageHub {
             codex: self.codex_enabled.load(Ordering::Relaxed),
             claude: self.claude_enabled.load(Ordering::Relaxed),
             claude_quota: self.claude_quota_enabled.load(Ordering::Relaxed),
+            antigravity: self.antigravity_enabled.load(Ordering::Relaxed),
         }
     }
 
@@ -146,6 +166,7 @@ impl UsageHub {
                 self.claude_enabled.load(Ordering::Relaxed)
                     && self.claude_quota_enabled.load(Ordering::Relaxed)
             }
+            Source::Antigravity => self.antigravity_enabled.load(Ordering::Relaxed),
         }
     }
 
@@ -156,6 +177,8 @@ impl UsageHub {
             .store(monitoring.claude, Ordering::Relaxed);
         self.claude_quota_enabled
             .store(monitoring.claude_quota, Ordering::Relaxed);
+        self.antigravity_enabled
+            .store(monitoring.antigravity, Ordering::Relaxed);
     }
 
     /// Reads saved switches from `<config dir>/monitoring.json`; a missing or broken file keeps defaults.
@@ -179,6 +202,7 @@ impl UsageHub {
             Source::Codex => next.codex = enabled,
             Source::Claude => next.claude = enabled,
             Source::ClaudeQuota => next.claude_quota = enabled,
+            Source::Antigravity => next.antigravity = enabled,
         }
         let path = self
             .preferences_path
@@ -200,9 +224,11 @@ impl UsageHub {
             }
         }
         if enabled {
-            if source != Source::Codex {
-                if let Ok(mut due) = self.due.lock() {
-                    due.claude_quota = None;
+            if let Ok(mut due) = self.due.lock() {
+                match source {
+                    Source::Claude | Source::ClaudeQuota => due.claude_quota = None,
+                    Source::Antigravity => due.antigravity = None,
+                    Source::Codex => {}
                 }
             }
             self.kick(source == Source::Codex);
@@ -224,6 +250,7 @@ impl UsageHub {
             due.local = Some(now);
             if include_codex {
                 due.codex = Some(now);
+                due.antigravity = None;
             }
         }
         self.signal.notify_all();
@@ -240,6 +267,12 @@ impl UsageHub {
                     .is_none_or(|last| last.elapsed() >= CLAUDE_QUOTA.visible)
                 {
                     due.claude_quota = None;
+                }
+                if due
+                    .last_antigravity
+                    .is_none_or(|last| last.elapsed() >= SHOW_STALE_AFTER)
+                {
+                    due.antigravity = None;
                 }
                 due.last_codex
                     .is_none_or(|last| last.elapsed() >= SHOW_STALE_AFTER)
@@ -262,6 +295,29 @@ impl UsageHub {
             Ok(mut service) => service.refresh(),
             Err(_) => UsageSnapshot::service_error("Usage service is unavailable"),
         }
+    }
+
+    pub fn refresh_antigravity(&self, visible: bool) -> AntigravitySnapshot {
+        let snapshot = match self.antigravity.lock() {
+            Ok(mut service) => service.fetch(),
+            Err(_) => AntigravitySnapshot {
+                status: "error".into(),
+                plan: None,
+                ai_credits: None,
+                version: None,
+                groups: Vec::new(),
+                models: Vec::new(),
+                fetched_at: claude_usage::unix_now(),
+                message: Some("Antigravity 服务暂时不可用".into()),
+            },
+        };
+        let delay = antigravity_delay(visible, &snapshot);
+        if let Ok(mut due) = self.due.lock() {
+            let now = Instant::now();
+            due.last_antigravity = Some(now);
+            due.antigravity = Some(now + delay);
+        }
+        snapshot
     }
 
     fn day_start(&self, now: i64) -> i64 {
@@ -331,6 +387,9 @@ impl UsageHub {
                 if let Some(snapshot) = self.claude_quota_if_due(visible) {
                     let _ = app.emit("usage://claude-quota", &snapshot);
                 }
+                if let Some(snapshot) = self.antigravity_if_due(visible) {
+                    let _ = app.emit("usage://antigravity", &snapshot);
+                }
                 if let Ok(mut due) = self.due.lock() {
                     due.local = Some(Instant::now() + LOCAL_TOKENS.next(visible, succeeded));
                 }
@@ -366,6 +425,23 @@ impl UsageHub {
         Some(snapshot)
     }
 
+    /// Fetches Antigravity quota when enabled and due; the loopback request runs without holding
+    /// the schedule lock so other sources are never blocked.
+    fn antigravity_if_due(&self, visible: bool) -> Option<AntigravitySnapshot> {
+        if !self.is_enabled(Source::Antigravity) {
+            return None;
+        }
+        let due = self
+            .due
+            .lock()
+            .map(|due| due.antigravity.is_none_or(|at| at <= Instant::now()))
+            .unwrap_or(false);
+        if !due {
+            return None;
+        }
+        Some(self.refresh_antigravity(visible))
+    }
+
     fn wait_for_work(&self, last_tick: &mut (Instant, SystemTime)) -> (bool, bool) {
         let mut due = match self.due.lock() {
             Ok(due) => due,
@@ -384,6 +460,7 @@ impl UsageHub {
             if std::mem::take(&mut due.wake) {
                 due.codex = Some(now);
                 due.local = Some(now);
+                due.antigravity = None;
             }
 
             let codex_due = due.codex.is_none_or(|at| at <= now);
@@ -414,6 +491,17 @@ impl UsageHub {
     }
 }
 
+fn antigravity_delay(visible: bool, snapshot: &AntigravitySnapshot) -> Duration {
+    if snapshot.status == "rate_limited" {
+        ANTIGRAVITY_RATE_LIMITED
+    } else if matches!(snapshot.status.as_str(), "not_installed" | "not_running") {
+        // Check gently when the app is not open instead of spinning every 30s.
+        ANTIGRAVITY_QUOTA.hidden
+    } else {
+        ANTIGRAVITY_QUOTA.next(visible, snapshot.succeeded())
+    }
+}
+
 pub fn panel_visible(app: &AppHandle) -> bool {
     app.get_webview_window("main")
         .and_then(|window| window.is_visible().ok())
@@ -431,6 +519,8 @@ mod tests {
         assert_eq!(CODEX_QUOTA.next(false, false), Duration::from_secs(30));
         assert_eq!(LOCAL_TOKENS.next(true, true), Duration::from_secs(10));
         assert_eq!(LOCAL_TOKENS.next(false, true), Duration::from_secs(30));
+        assert_eq!(ANTIGRAVITY_QUOTA.next(true, true), Duration::from_secs(30));
+        assert_eq!(ANTIGRAVITY_QUOTA.next(false, true), Duration::from_secs(60));
     }
 
     #[test]
@@ -465,12 +555,14 @@ mod tests {
             Monitoring {
                 codex: true,
                 claude: false,
-                claude_quota: false
+                claude_quota: false,
+                antigravity: false,
             }
         );
         hub.set_enabled(Source::Claude, true).unwrap();
         hub.set_enabled(Source::Codex, false).unwrap();
         hub.set_enabled(Source::ClaudeQuota, true).unwrap();
+        hub.set_enabled(Source::Antigravity, true).unwrap();
 
         let reloaded = UsageHub::new();
         reloaded.load_preferences(Some(directory.clone()));
@@ -479,7 +571,8 @@ mod tests {
             Monitoring {
                 codex: false,
                 claude: true,
-                claude_quota: true
+                claude_quota: true,
+                antigravity: true,
             }
         );
         let (tokens, _) = reloaded.read_local();
@@ -488,13 +581,76 @@ mod tests {
             "Codex token stats are skipped while Codex is off"
         );
         assert!(reloaded.is_enabled(Source::ClaudeQuota));
+        assert!(reloaded.is_enabled(Source::Antigravity));
         reloaded.set_enabled(Source::Claude, false).unwrap();
         assert!(
             !reloaded.is_enabled(Source::ClaudeQuota),
             "quota follows the Claude switch"
         );
         assert!(reloaded.claude_quota_if_due(false).is_none());
+        reloaded.set_enabled(Source::Antigravity, false).unwrap();
+        assert!(
+            reloaded.antigravity_if_due(false).is_none(),
+            "Antigravity stops polling once switched off"
+        );
         let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn legacy_monitoring_config_defaults_antigravity_to_off() {
+        let directory = std::env::temp_dir().join(format!(
+            "codex-meter-legacy-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("monitoring.json"),
+            br#"{"codex":true,"claude":true,"claudeQuota":true}"#,
+        )
+        .unwrap();
+
+        let hub = UsageHub::new();
+        hub.load_preferences(Some(directory.clone()));
+        assert_eq!(
+            hub.monitoring(),
+            Monitoring {
+                codex: true,
+                claude: true,
+                claude_quota: true,
+                antigravity: false,
+            }
+        );
+        assert!(hub.antigravity_if_due(true).is_none());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn antigravity_rate_limit_backs_off_without_affecting_other_sources() {
+        let rate_limited = AntigravitySnapshot {
+            status: "rate_limited".into(),
+            plan: None,
+            ai_credits: None,
+            version: None,
+            groups: Vec::new(),
+            models: Vec::new(),
+            fetched_at: 0,
+            message: Some("too many requests".into()),
+        };
+        assert_eq!(
+            antigravity_delay(true, &rate_limited),
+            ANTIGRAVITY_RATE_LIMITED
+        );
+
+        let hub = UsageHub::new();
+        assert!(hub.is_enabled(Source::Codex));
+        assert!(!hub.is_enabled(Source::Antigravity));
+        // Even while Antigravity is disabled or fails, Codex remains due independently.
+        let mut tick = (Instant::now(), SystemTime::now());
+        assert_eq!(hub.wait_for_work(&mut tick), (true, true));
     }
 
     #[test]

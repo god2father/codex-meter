@@ -1,3 +1,4 @@
+mod antigravity;
 mod claude_quota;
 mod claude_usage;
 mod codex;
@@ -6,6 +7,7 @@ mod macos_tray;
 mod scheduler;
 mod token_usage;
 
+use antigravity::AntigravitySnapshot;
 use codex::UsageSnapshot;
 use scheduler::UsageHub;
 use serde::Serialize;
@@ -121,11 +123,27 @@ async fn refresh_usage(
 }
 
 #[tauri::command]
+async fn refresh_antigravity(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<AntigravitySnapshot, String> {
+    let hub = Arc::clone(&state.0);
+    if !hub.is_enabled(scheduler::Source::Antigravity) {
+        return Err("Antigravity 额度监测已关闭".into());
+    }
+    let visible = scheduler::panel_visible(&app);
+    let snapshot = tauri::async_runtime::spawn_blocking(move || hub.refresh_antigravity(visible))
+        .await
+        .map_err(|_| "Antigravity 刷新任务意外中断".to_owned())?;
+    Ok(snapshot)
+}
+
+#[tauri::command]
 fn monitoring_status(state: State<'_, AppState>) -> scheduler::Monitoring {
     state.0.monitoring()
 }
 
-/// Turns Codex or Claude monitoring on or off; the choice survives restarts.
+/// Turns Codex, Claude, or Antigravity monitoring on or off; the choice survives restarts.
 #[tauri::command]
 fn set_monitoring(
     state: State<'_, AppState>,
@@ -136,6 +154,7 @@ fn set_monitoring(
         "codex" => scheduler::Source::Codex,
         "claude" => scheduler::Source::Claude,
         "claudeQuota" => scheduler::Source::ClaudeQuota,
+        "antigravity" => scheduler::Source::Antigravity,
         _ => return Err("Unknown usage source".into()),
     };
     state.0.set_enabled(source, enabled)?;
@@ -820,6 +839,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
+            refresh_antigravity,
             monitoring_status,
             set_monitoring,
             request_usage_refresh,

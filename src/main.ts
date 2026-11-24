@@ -258,6 +258,9 @@ const mockAntigravitySnapshot: AntigravitySnapshot = {
 
 const CACHE_KEY = "codex-meter:last-usage";
 const TRAY_SOURCE_KEY = "codex-meter:tray-source";
+const CARD_ORDER_KEY = "codex-meter:card-order";
+type CardSource = "codex" | "claude" | "antigravity";
+const DEFAULT_CARD_ORDER: readonly CardSource[] = ["codex", "claude", "antigravity"];
 type TraySource = "codex" | "claude" | "antigravity";
 const STALE_AFTER_SECONDS = 5 * 60;
 const themeQuery = window.matchMedia("(prefers-color-scheme: dark)");
@@ -303,6 +306,9 @@ let lastRenderedFreshness: DataFreshness | null = null;
 let freshnessExpiryTimer = 0;
 let lastTrayKey = "";
 let trayPreference: TraySource = loadTrayPreference();
+let cardOrder: CardSource[] = loadCardOrder();
+let draggingSource: CardSource | null = null;
+let pendingRender = false;
 let exitArmed = false;
 let appVersion = "";
 let exitArmTimer = 0;
@@ -533,6 +539,44 @@ function scheduleFreshnessExpiry(): void {
   }, nextSeconds * 1000 + 50);
 }
 
+function loadCardOrder(): CardSource[] {
+  try {
+    const raw = localStorage.getItem(CARD_ORDER_KEY);
+    if (!raw) return [...DEFAULT_CARD_ORDER];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [...DEFAULT_CARD_ORDER];
+    const valid: CardSource[] = [];
+    for (const item of parsed) {
+      if ((item === "codex" || item === "claude" || item === "antigravity") && !valid.includes(item)) {
+        valid.push(item);
+      }
+    }
+    for (const fallback of DEFAULT_CARD_ORDER) {
+      if (!valid.includes(fallback)) valid.push(fallback);
+    }
+    return valid;
+  } catch {
+    return [...DEFAULT_CARD_ORDER];
+  }
+}
+
+function saveCardOrder(order: CardSource[]): void {
+  try {
+    localStorage.setItem(CARD_ORDER_KEY, JSON.stringify(order));
+  } catch {
+    // Persistence failure should never block reordering in the current session.
+  }
+}
+
+function orderedMonitoringSources(): UsageSource[] {
+  const sources: UsageSource[] = [];
+  for (const source of cardOrder) {
+    sources.push(source);
+    if (source === "claude") sources.push("claudeQuota");
+  }
+  return sources;
+}
+
 function loadTrayPreference(): TraySource {
   try {
     const saved = localStorage.getItem(TRAY_SOURCE_KEY);
@@ -543,12 +587,14 @@ function loadTrayPreference(): TraySource {
   }
 }
 
-/** Sources able to drive the tray ring. Token-only views have no reliable quota percentage. */
+/** Sources able to drive the tray ring, ordered to match the user's card order. */
 function traySources(): TraySource[] {
   const sources: TraySource[] = [];
-  if (monitoring.codex) sources.push("codex");
-  if (monitoring.claude && monitoring.claudeQuota) sources.push("claude");
-  if (monitoring.antigravity) sources.push("antigravity");
+  for (const source of cardOrder) {
+    if (source === "codex" && monitoring.codex) sources.push("codex");
+    if (source === "claude" && monitoring.claude && monitoring.claudeQuota) sources.push("claude");
+    if (source === "antigravity" && monitoring.antigravity) sources.push("antigravity");
+  }
   return sources;
 }
 
@@ -668,15 +714,17 @@ function sourceSwitch(source: UsageSource): string {
   return `<label class="setting-toggle source-switch" title="${monitoring[source] ? "关闭" : "开启"}${SOURCE_LABEL[source]}"><input type="checkbox" data-monitor="${source}" aria-label="${SOURCE_LABEL[source]}" ${monitoring[source] ? "checked" : ""} ${busy ? "disabled" : ""}><span class="switch" aria-hidden="true"><i></i></span></label>`;
 }
 
-function renderMonitorOff(source: "codex" | "claude" | "antigravity"): string {
+const DRAG_GRIP = '<span class="drag-grip" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i></span>';
+
+function renderMonitorOff(source: CardSource): string {
   const [title, mark, copy, cardClass, markClass] = source === "codex"
     ? ["Codex", icon("app"), "额度与 Token 监测已关闭，不会启动 Codex 后台服务。", "", ""]
     : source === "claude"
       ? ["Claude Code", icon("spark"), "开启后读取本机 Claude Code 记录中的 Token 数字，不读取对话内容。", " claude-card", " claude-mark"]
       : ["Antigravity", icon("orbit"), "开启后从本机 Antigravity 后台服务读取模型剩余额度与重置时间。", " antigravity-card", " antigravity-mark"];
-  return `<section class="token-card monitor-off${cardClass}" aria-label="${title} 监测已关闭">
-    <div class="token-card-head">
-      <div><span class="token-mark${markClass}">${mark}</span><strong>${title}</strong></div>
+  return `<section class="token-card monitor-off${cardClass}" data-card-source="${source}" aria-label="${title} 监测已关闭">
+    <div class="token-card-head" title="拖动调整卡片顺序">
+      <div>${DRAG_GRIP}<span class="token-mark${markClass}">${mark}</span><strong>${title}</strong></div>
       ${sourceSwitch(source)}
     </div>
     <p class="token-note">${copy}</p>
@@ -718,15 +766,15 @@ function quotaCell(
   </div>`;
 }
 
-/** Shared card header: source mark and name, plan, and optional details toggle. */
-function cardHead(source: "codex" | "claude" | "antigravity", plan: string, open: boolean, showDetails = true): string {
+/** Shared card header: drag grip, source mark and name, plan, and optional details toggle. */
+function cardHead(source: CardSource, plan: string, open: boolean, showDetails = true): string {
   const [name, mark, action, controls] = source === "codex"
     ? ["Codex", `<span class="token-mark">${icon("app")}</span>`, "token-details", "token-details"]
     : source === "claude"
       ? ["Claude Code", `<span class="token-mark claude-mark">${icon("spark")}</span>`, "claude-details", "claude-details"]
       : ["Antigravity", `<span class="token-mark antigravity-mark">${icon("orbit")}</span>`, "antigravity-details", "antigravity-details"];
-  return `<div class="token-card-head">
-    <div>${mark}<strong>${name}</strong>${plan ? `<span class="card-plan">${plan}</span>` : ""}</div>
+  return `<div class="token-card-head" title="拖动调整卡片顺序">
+    <div>${DRAG_GRIP}${mark}<strong>${name}</strong>${plan ? `<span class="card-plan">${plan}</span>` : ""}</div>
     ${showDetails ? `<button class="token-detail-button" data-action="${action}" aria-expanded="${open}" aria-controls="${controls}">${open ? "收起" : "明细"}${icon("chevron")}</button>` : ""}
   </div>`;
 }
@@ -743,7 +791,7 @@ function renderSettings(): string {
     <p class="setting-note">外观跟随系统。Codex 与 Antigravity 额度每 30–60 秒刷新，Token 统计每 10–30 秒，Claude 订阅额度每 2–5 分钟。</p>
     <div class="section-caption settings-caption"><span>监测</span></div>
     <div class="settings-group">
-      ${(["codex", "claude", "claudeQuota", "antigravity"] as UsageSource[]).map(source => {
+      ${orderedMonitoringSources().map(source => {
         const blocked = source === "claudeQuota" && !monitoring.claude;
         const hint = source === "codex" ? "订阅额度与本机 Codex Token"
           : source === "claude" ? "本机 ~/.claude 记录中的 Token"
@@ -804,7 +852,7 @@ function renderCodexCard(): string {
           : "";
 
   return `
-    <section class="token-card" aria-label="Codex 用量">
+    <section class="token-card" data-card-source="codex" aria-label="Codex 用量">
       ${cardHead("codex", plan, tokenDetailsOpen)}
       <div class="card-quota" role="group" aria-label="Codex 剩余额度">
         ${windows.length
@@ -874,8 +922,8 @@ function renderClaudeUsage(): string {
   const data = claudeSnapshot;
   if (!monitoring.claude) return renderMonitorOff("claude");
   if (isTauri && data && !data.sourceAvailable) {
-    return `<section class="token-card claude-card" aria-label="Claude 用量">
-      <div class="token-card-head"><div><span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div></div>
+    return `<section class="token-card claude-card" data-card-source="claude" aria-label="Claude 用量">
+      <div class="token-card-head" title="拖动调整卡片顺序"><div>${DRAG_GRIP}<span class="token-mark claude-mark">${icon("spark")}</span><strong>Claude Code</strong></div></div>
       <p class="token-note">尚未发现本机 Claude Code 记录</p>
     </section>`;
   }
@@ -899,7 +947,7 @@ function renderClaudeUsage(): string {
     `<tr${key === "totalTokens" ? ' class="token-total-row"' : ""}><th scope="row">${label}</th>${renderTokenTableCell(block?.[key], available && Boolean(block))}${renderTokenTableCell(today?.[key], available)}${renderTokenTableCell(session?.[key], available && Boolean(session))}</tr>`;
   const plan = monitoring.claudeQuota && claudeQuota?.plan ? escapeHtml(formatPlan(claudeQuota.plan)) : "";
   return `
-    <section class="token-card claude-card" aria-label="Claude 用量">
+    <section class="token-card claude-card" data-card-source="claude" aria-label="Claude 用量">
       ${cardHead("claude", plan, claudeDetailsOpen)}
       ${renderClaudeQuota()}
       <div class="token-summary-grid" role="group" aria-label="Claude 用量摘要（输入加输出）">
@@ -949,7 +997,7 @@ function renderAntigravityCard(): string {
   const hasModels = Boolean(data && data.models.length > 0);
 
   if (!data) {
-    return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+    return `<section class="token-card antigravity-card" data-card-source="antigravity" aria-label="Antigravity 用量">
       ${cardHead("antigravity", plan, false, false)}
       <div class="card-quota card-quota--standalone">
         <div class="quota-empty">${icon("clock")}<span>正在连接本机 Antigravity…</span></div>
@@ -963,7 +1011,7 @@ function renderAntigravityCard(): string {
 
   if (!data.groups.length) {
     const canRetry = data.status === "not_running" || data.status === "error" || data.status === "no_data";
-    return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+    return `<section class="token-card antigravity-card" data-card-source="antigravity" aria-label="Antigravity 用量">
       ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
       <div class="card-quota card-quota--standalone">
         <div class="quota-empty">
@@ -983,7 +1031,7 @@ function renderAntigravityCard(): string {
       : "";
   const footerNote = antigravityFooterNote(data);
 
-  return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
+  return `<section class="token-card antigravity-card" data-card-source="antigravity" aria-label="Antigravity 用量">
     ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
     <div class="card-quota card-quota--standalone${stale ? " is-stale" : ""}" role="group" aria-label="Antigravity 剩余额度">
       <div class="quota-grid">${data.groups.map(group => {
@@ -1012,7 +1060,18 @@ function renderAntigravityCard(): string {
   </section>`;
 }
 
+function renderCardBySource(source: CardSource): string {
+  if (source === "codex") return monitoring.codex ? renderCodexCard() : renderMonitorOff("codex");
+  if (source === "claude") return renderClaudeUsage();
+  return renderAntigravityCard();
+}
+
 function render(): void {
+  if (draggingSource) {
+    pendingRender = true;
+    return;
+  }
+  pendingRender = false;
   const freshness = dataFreshness();
   const anyRefreshing = refreshing || antigravityRefreshing;
   const state = monitoring.codex
@@ -1037,7 +1096,7 @@ function render(): void {
         <div class="header-actions">${!isTauri ? '<span class="mock-badge">预览</span>' : ""}${!settingsOpen ? `<button class="icon-button header-refresh" data-action="refresh" aria-label="刷新用量" title="刷新用量" aria-busy="${anyRefreshing}" ${anyRefreshing ? "disabled" : ""}>${icon("refresh")}</button><button class="icon-button settings-button" data-action="settings" aria-label="偏好设置" title="偏好设置" aria-expanded="false">${icon("settings")}</button>` : ""}</div>
       </header>
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
-        ${settingsOpen ? renderSettings() : `${monitoring.codex ? renderCodexCard() : renderMonitorOff("codex")}${renderClaudeUsage()}${renderAntigravityCard()}`}
+        ${settingsOpen ? renderSettings() : cardOrder.map(renderCardBySource).join("")}
       </div>
       <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(footerStatusCopy(freshness) || statusCopy().detail)}">${footerStatusCopy(freshness) ? `${icon(state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy(freshness))}</span>` : ""}</div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
@@ -1838,10 +1897,165 @@ app.addEventListener("change", (event) => {
   if (input) void setAutostart(input.checked);
 });
 
+let cancelActiveDrag: (() => void) | null = null;
+
+function animateFlip(elements: HTMLElement[], previousTops: Map<HTMLElement, number>): void {
+  for (const element of elements) {
+    const oldTop = previousTops.get(element);
+    if (oldTop === undefined) continue;
+    const delta = oldTop - element.getBoundingClientRect().top;
+    if (Math.abs(delta) < 1) continue;
+    element.style.transition = "none";
+    element.style.transform = `translate3d(0, ${delta}px, 0)`;
+    element.getBoundingClientRect();
+    element.style.transition = "transform 180ms var(--ease)";
+    element.style.transform = "";
+    const clear = () => {
+      element.style.transition = "";
+      element.removeEventListener("transitionend", clear);
+    };
+    element.addEventListener("transitionend", clear);
+  }
+}
+
+app.addEventListener("pointerdown", (event) => {
+  if (settingsOpen || event.button !== 0 || cancelActiveDrag) return;
+  const target = event.target as Element | null;
+  if (!target || target.closest("button, label, input, a")) return;
+  const head = target.closest<HTMLElement>(".token-card-head");
+  const card = head?.closest<HTMLElement>("section[data-card-source]");
+  const container = card?.parentElement;
+  if (!head || !card || !container) return;
+  const source = card.dataset.cardSource as CardSource | undefined;
+  if (!source) return;
+
+  const pointerId = event.pointerId;
+  const initialOrder = [...cardOrder];
+  let anchorY = event.clientY;
+  let active = false;
+
+  const siblings = (): HTMLElement[] =>
+    Array.from(container.querySelectorAll<HTMLElement>(":scope > section[data-card-source]"));
+
+  const startDrag = (): void => {
+    active = true;
+    draggingSource = source;
+    document.documentElement.dataset.dragging = "true";
+    card.classList.add("is-dragging");
+    try {
+      card.setPointerCapture(pointerId);
+    } catch {
+      // Synthetic pointer events in automated browsers may not support capture.
+    }
+  };
+
+  const onMove = (moveEvent: PointerEvent): void => {
+    if (moveEvent.pointerId !== pointerId) return;
+    const dy = moveEvent.clientY - anchorY;
+    if (!active) {
+      if (Math.abs(dy) < 5) return;
+      startDrag();
+    }
+    moveEvent.preventDefault();
+    card.style.transform = `translate3d(0, ${dy}px, 0) scale(1.015)`;
+
+    const rect = card.getBoundingClientRect();
+    const centerY = rect.top + rect.height / 2;
+    const cards = siblings();
+    const currentIndex = cards.indexOf(card);
+    if (currentIndex === -1) return;
+
+    let targetIndex = currentIndex;
+    for (let i = 0; i < cards.length; i += 1) {
+      if (i === currentIndex) continue;
+      const otherRect = cards[i].getBoundingClientRect();
+      const otherCenter = otherRect.top + otherRect.height / 2;
+      if (i < currentIndex && centerY < otherCenter) {
+        targetIndex = i;
+        break;
+      }
+      if (i > currentIndex && centerY > otherCenter) {
+        targetIndex = i;
+      }
+    }
+
+    if (targetIndex !== currentIndex) {
+      const others = cards.filter((item) => item !== card);
+      const previousTops = new Map<HTMLElement, number>();
+      for (const item of others) previousTops.set(item, item.getBoundingClientRect().top);
+
+      const oldCardTop = card.getBoundingClientRect().top;
+      if (targetIndex < currentIndex) {
+        container.insertBefore(card, cards[targetIndex]);
+      } else {
+        container.insertBefore(card, cards[targetIndex].nextSibling);
+      }
+      const newCardTop = card.getBoundingClientRect().top;
+      anchorY += newCardTop - oldCardTop;
+      const nextDy = moveEvent.clientY - anchorY;
+      card.style.transform = `translate3d(0, ${nextDy}px, 0) scale(1.015)`;
+
+      animateFlip(others, previousTops);
+      cardOrder = siblings()
+        .map((item) => item.dataset.cardSource as CardSource)
+        .filter((item): item is CardSource => item === "codex" || item === "claude" || item === "antigravity");
+    }
+  };
+
+  const finish = (commit: boolean): void => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onCancel);
+    window.removeEventListener("blur", onCancel);
+    cancelActiveDrag = null;
+    if (!active) return;
+
+    try {
+      if (card.hasPointerCapture(pointerId)) card.releasePointerCapture(pointerId);
+    } catch {
+      // Ignore if pointer capture was already released.
+    }
+    delete document.documentElement.dataset.dragging;
+    card.classList.remove("is-dragging");
+    card.style.transform = "";
+    draggingSource = null;
+
+    if (!commit) {
+      cardOrder = initialOrder;
+    } else if (cardOrder.some((item, index) => item !== initialOrder[index])) {
+      saveCardOrder(cardOrder);
+    }
+
+    if (pendingRender || !commit || cardOrder.some((item, index) => item !== initialOrder[index])) {
+      render();
+      void updateTrayIcon(snapshot);
+    }
+  };
+
+  const onUp = (upEvent: PointerEvent): void => {
+    if (upEvent.pointerId !== pointerId) return;
+    finish(true);
+  };
+
+  const onCancel = (): void => {
+    finish(false);
+  };
+
+  cancelActiveDrag = () => finish(false);
+  window.addEventListener("pointermove", onMove, { passive: false });
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onCancel);
+  window.addEventListener("blur", onCancel);
+});
+
 render();
 
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
+  if (cancelActiveDrag) {
+    cancelActiveDrag();
+    return;
+  }
   // Escape steps back out of settings first; a second press closes the panel in Tauri.
   if (settingsOpen) {
     settingsOpen = false;

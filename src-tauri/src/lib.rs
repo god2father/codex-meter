@@ -123,6 +123,11 @@ async fn refresh_usage(
 }
 
 #[tauri::command]
+fn cached_antigravity(state: State<'_, AppState>) -> Option<AntigravitySnapshot> {
+    state.0.cached_antigravity()
+}
+
+#[tauri::command]
 async fn refresh_antigravity(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
@@ -839,6 +844,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             refresh_usage,
+            cached_antigravity,
             refresh_antigravity,
             monitoring_status,
             set_monitoring,

@@ -20,7 +20,8 @@ use std::{
 };
 
 const GET_USER_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_DISCOVERY_BYTES: u64 = 64 * 1024;
 const FRACTION_SCALE: f64 = 1_000_000.0;
 
@@ -104,9 +105,10 @@ impl AntigravityService {
 
     fn client(&mut self) -> Option<reqwest::blocking::Client> {
         if self.client.is_none() {
-            // Loopback requests must bypass system HTTP/SOCKS proxies.
+            // Loopback requests must bypass system HTTP/SOCKS proxies and fail fast on dead ports.
             self.client = reqwest::blocking::Client::builder()
                 .no_proxy()
+                .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
                 .user_agent(concat!("codex-meter/", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -345,17 +347,14 @@ fn discover_endpoints(directory: &Path) -> Vec<DaemonEndpoint> {
             continue;
         };
         if let Some(endpoint) = parse_daemon_discovery(&bytes, modified_secs) {
-            endpoints.push(endpoint);
+            // Skip stale discovery files whose recorded process has already exited so we never
+            // send requests to an unrelated local service that happened to reuse the port.
+            if endpoint.pid.is_none_or(pid_is_alive) {
+                endpoints.push(endpoint);
+            }
         }
     }
-    // Prefer endpoints whose recorded PID is alive, then newest discovery file first.
-    endpoints.sort_by(|a, b| {
-        let a_alive = a.pid.is_none_or(pid_is_alive);
-        let b_alive = b.pid.is_none_or(pid_is_alive);
-        b_alive
-            .cmp(&a_alive)
-            .then_with(|| b.modified_secs.cmp(&a.modified_secs))
-    });
+    endpoints.sort_by(|a, b| b.modified_secs.cmp(&a.modified_secs));
     endpoints
 }
 
@@ -1145,6 +1144,46 @@ mod tests {
         assert_eq!(endpoints.len(), 1);
         assert_eq!(endpoints[0].http_port, 50001);
         assert_eq!(endpoints[0].ls_version.as_deref(), Some("2.34.0"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skips_stale_discovery_files_for_exited_processes() {
+        let mut child = std::process::Command::new("/usr/bin/true")
+            .spawn()
+            .expect("spawn short-lived process");
+        let dead_pid = child.id();
+        let _ = child.wait();
+
+        let dir = env::temp_dir().join(format!(
+            "codex-meter-agy-stale-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("hub_dead.json"),
+            format!(
+                r#"{{"pid": {dead_pid}, "httpPort": 50002, "lsVersion": "2.34.0", "csrfToken": "dead-csrf"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("hub_live.json"),
+            format!(
+                r#"{{"pid": {}, "httpPort": 50003, "lsVersion": "2.34.0", "csrfToken": "live-csrf"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+
+        let endpoints = discover_endpoints(&dir);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].http_port, 50003);
         let _ = fs::remove_dir_all(&dir);
     }
 }

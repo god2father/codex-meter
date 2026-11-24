@@ -121,6 +121,7 @@ pub struct UsageHub {
     claude: Mutex<ClaudeUsageService>,
     claude_quota: Mutex<ClaudeQuotaService>,
     antigravity: Mutex<AntigravityService>,
+    last_antigravity: Mutex<Option<AntigravitySnapshot>>,
     offset_east_seconds: AtomicI64,
     codex_enabled: AtomicBool,
     claude_enabled: AtomicBool,
@@ -138,6 +139,7 @@ impl UsageHub {
             claude: Mutex::new(ClaudeUsageService::new()),
             claude_quota: Mutex::new(ClaudeQuotaService::new()),
             antigravity: Mutex::new(AntigravityService::new()),
+            last_antigravity: Mutex::new(None),
             offset_east_seconds: AtomicI64::new(0),
             codex_enabled: AtomicBool::new(Monitoring::default().codex),
             claude_enabled: AtomicBool::new(Monitoring::default().claude),
@@ -223,6 +225,11 @@ impl UsageHub {
                 service.disconnect();
             }
         }
+        if source == Source::Antigravity && !enabled {
+            if let Ok(mut cached) = self.last_antigravity.lock() {
+                *cached = None;
+            }
+        }
         if enabled {
             if let Ok(mut due) = self.due.lock() {
                 match source {
@@ -297,6 +304,16 @@ impl UsageHub {
         }
     }
 
+    pub fn cached_antigravity(&self) -> Option<AntigravitySnapshot> {
+        if !self.is_enabled(Source::Antigravity) {
+            return None;
+        }
+        self.last_antigravity
+            .lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+    }
+
     pub fn refresh_antigravity(&self, visible: bool) -> AntigravitySnapshot {
         let snapshot = match self.antigravity.lock() {
             Ok(mut service) => service.fetch(),
@@ -316,6 +333,11 @@ impl UsageHub {
             let now = Instant::now();
             due.last_antigravity = Some(now);
             due.antigravity = Some(now + delay);
+        }
+        if self.is_enabled(Source::Antigravity) {
+            if let Ok(mut cached) = self.last_antigravity.lock() {
+                *cached = Some(snapshot.clone());
+            }
         }
         snapshot
     }
@@ -384,11 +406,13 @@ impl UsageHub {
                 if let Some(snapshot) = claude {
                     let _ = app.emit("usage://claude", &snapshot);
                 }
-                if let Some(snapshot) = self.claude_quota_if_due(visible) {
-                    let _ = app.emit("usage://claude-quota", &snapshot);
-                }
+                // Run fast local loopback Antigravity fetch before remote ClaudeQuota so network
+                // latency never delays local quota updates.
                 if let Some(snapshot) = self.antigravity_if_due(visible) {
                     let _ = app.emit("usage://antigravity", &snapshot);
+                }
+                if let Some(snapshot) = self.claude_quota_if_due(visible) {
+                    let _ = app.emit("usage://claude-quota", &snapshot);
                 }
                 if let Ok(mut due) = self.due.lock() {
                     due.local = Some(Instant::now() + LOCAL_TOKENS.next(visible, succeeded));
@@ -592,6 +616,10 @@ mod tests {
         assert!(
             reloaded.antigravity_if_due(false).is_none(),
             "Antigravity stops polling once switched off"
+        );
+        assert!(
+            reloaded.cached_antigravity().is_none(),
+            "cached Antigravity snapshot is cleared when switched off"
         );
         let _ = fs::remove_dir_all(&directory);
     }

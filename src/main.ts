@@ -460,8 +460,30 @@ function antigravityIsExpired(data: AntigravitySnapshot | null): boolean {
   return Boolean(data && data.groups.length > 0 && antigravityAgeSeconds(data) >= STALE_AFTER_SECONDS);
 }
 
+function antigravityPanelState(): string {
+  const data = antigravitySnapshot;
+  if (!data) return "loading";
+  if (antigravityIsExpired(data)) return "expired";
+  if (data.stale) return "reconnecting";
+  if (data.status === "ok") return "ok";
+  return "error";
+}
+
 function footerStatusCopy(freshness = dataFreshness()): string {
   if (!monitoring.codex) {
+    if (!monitoring.claude && monitoring.antigravity) {
+      const data = antigravitySnapshot;
+      if (!data) return "正在连接本机 Antigravity";
+      if (antigravityIsExpired(data)) {
+        return `Antigravity 数据已过期 · 上次成功更新于 ${Math.max(1, Math.floor(antigravityAgeSeconds(data) / 60))} 分钟前`;
+      }
+      if (data.stale) {
+        return `Antigravity 正在重连 · 显示 ${Math.max(1, Math.floor(antigravityAgeSeconds(data) / 60))} 分钟前的数据`;
+      }
+      if (data.status === "limit_reached") return "Antigravity 额度已用尽，等待重置";
+      if (data.status !== "ok") return data.message || ANTIGRAVITY_STATUS_HINT[data.status];
+      return "仅监测 Antigravity";
+    }
     const active = [
       monitoring.claude ? "Claude Code" : "",
       monitoring.antigravity ? "Antigravity" : "",
@@ -671,11 +693,15 @@ function quotaCell(
   headingTitle = "",
 ): string {
   const safeLabel = escapeHtml(label);
+  const resetAttr = resetsAt !== null ? ` data-reset-at="${resetsAt}"` : "";
   if (remaining === null || !Number.isFinite(remaining)) {
+    const unknownTitle = resetsAt !== null
+      ? "接口未返回剩余比例，可能已耗尽或暂不可用"
+      : "接口未返回剩余比例";
     return `<div class="quota-window" data-tone="unknown">
-      <div class="quota-heading"><span${headingTitle ? ` title="${escapeHtml(headingTitle)}"` : ""}>${safeLabel}</span><strong aria-label="${escapeHtml(source)} ${safeLabel}剩余未知">—</strong></div>
+      <div class="quota-heading"><span${headingTitle ? ` title="${escapeHtml(headingTitle)}"` : ""}>${safeLabel}</span><strong aria-label="${escapeHtml(source)} ${safeLabel}剩余未知" title="${unknownTitle}">—</strong></div>
       <div class="quota-track" aria-hidden="true"></div>
-      <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
+      <span class="reset-time"${resetAttr} title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
     </div>`;
   }
   const value = clampPercent(remaining);
@@ -688,7 +714,7 @@ function quotaCell(
   return `<div class="quota-window" data-tone="${usageTone(value)}">
     <div class="quota-heading"><span${headingTitle ? ` title="${escapeHtml(headingTitle)}"` : ""}>${safeLabel}</span><strong>${value}<small>%</small></strong></div>
     <div class="quota-track" role="meter" aria-label="${escapeHtml(source)} ${safeLabel}剩余" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${value}"${pace !== null ? ` title="额度剩 ${value}%，窗口时间剩 ${pace}%"` : ""}><i style="width:${value}%"></i>${pace !== null ? `<b class="quota-pace" style="left:${pace}%" aria-hidden="true"></b>` : ""}</div>
-    <span class="reset-time" title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
+    <span class="reset-time"${resetAttr} title="${formatResetExact(resetsAt)}">${formatReset(resetsAt)}</span>
   </div>`;
 }
 
@@ -895,6 +921,12 @@ function renderClaudeUsage(): string {
     </section>`;
 }
 
+function antigravityFooterNote(data: AntigravitySnapshot): string {
+  return antigravityRefreshing
+    ? "正在刷新本机 Antigravity 额度…"
+    : `${formatUpdated(data.fetchedAt)} · ${data.groups.length > 1 ? `${data.groups.length} 个共享额度分组` : "共享额度分组"}`;
+}
+
 const ANTIGRAVITY_STATUS_HINT: Record<AntigravityStatus, string> = {
   ok: "",
   limit_reached: "所有已知模型分组额度已用尽，等待重置。",
@@ -949,9 +981,7 @@ function renderAntigravityCard(): string {
     : data.stale
       ? `<p class="token-note claude-quota-hint" role="status">显示 ${ageMinutes} 分钟前的数据${hint ? ` · ${escapeHtml(hint)}` : ""}</p>`
       : "";
-  const footerNote = antigravityRefreshing
-    ? "正在刷新本机 Antigravity 额度…"
-    : `${formatUpdated(data.fetchedAt)} · ${data.groups.length > 1 ? `${data.groups.length} 个共享额度分组` : "共享额度分组"}`;
+  const footerNote = antigravityFooterNote(data);
 
   return `<section class="token-card antigravity-card" aria-label="Antigravity 用量">
     ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
@@ -969,23 +999,27 @@ function renderAntigravityCard(): string {
           <thead><tr><th scope="col">模型</th><th scope="col">剩余</th><th scope="col">重置</th></tr></thead>
           <tbody>
             ${data.models.map(item => {
-              const remText = item.remainingPercent !== null && Number.isFinite(item.remainingPercent)
-                ? `${clampPercent(item.remainingPercent)}%`
-                : "—";
+              const remKnown = item.remainingPercent !== null && Number.isFinite(item.remainingPercent);
+              const remText = remKnown ? `${clampPercent(item.remainingPercent!)}%` : "—";
+              const remTitle = remKnown ? "" : ' title="接口未返回剩余比例，可能已耗尽或暂不可用"';
               const resetText = item.resetsAt !== null ? formatReset(item.resetsAt).replace(/重置$/, "").trim() : "未知";
-              return `<tr><th scope="row" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</th><td>${remText}</td><td title="${escapeHtml(formatResetExact(item.resetsAt))}">${escapeHtml(resetText)}</td></tr>`;
+              return `<tr><th scope="row" title="${escapeHtml(item.label)}">${escapeHtml(item.label)}</th><td${remTitle}>${remText}</td><td title="${escapeHtml(formatResetExact(item.resetsAt))}">${escapeHtml(resetText)}</td></tr>`;
             }).join("")}
           </tbody>
         </table>
       </div>` : ""}
-    <p class="token-note" role="note">${escapeHtml(footerNote)}</p>
+    <p class="token-note" data-agy-note role="note">${escapeHtml(footerNote)}</p>
   </section>`;
 }
 
 function render(): void {
   const freshness = dataFreshness();
   const anyRefreshing = refreshing || antigravityRefreshing;
-  const state = !monitoring.codex ? "paused" : freshness === "fresh" ? snapshot?.status === "limit_reached" ? "error" : "ok" : freshness;
+  const state = monitoring.codex
+    ? freshness === "fresh" ? (snapshot?.status === "limit_reached" ? "error" : "ok") : freshness
+    : !monitoring.claude && monitoring.antigravity
+      ? antigravityPanelState()
+      : "paused";
   const view = settingsOpen ? "settings" : "home";
   const changedView = view !== lastView;
   lastView = view;
@@ -1005,7 +1039,7 @@ function render(): void {
       <div class="panel-scroll${changedView ? " view-enter" : ""}">
         ${settingsOpen ? renderSettings() : `${monitoring.codex ? renderCodexCard() : renderMonitorOff("codex")}${renderClaudeUsage()}${renderAntigravityCard()}`}
       </div>
-      <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(statusCopy().detail)}">${footerStatusCopy(freshness) ? `${icon(state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy(freshness))}</span>` : ""}</div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
+      <footer class="panel-footer"><div class="updated" role="status" title="${escapeHtml(footerStatusCopy(freshness) || statusCopy().detail)}">${footerStatusCopy(freshness) ? `${icon(state === "loading" ? "clock" : state === "paused" ? "power" : "alert")}<span>${escapeHtml(footerStatusCopy(freshness))}</span>` : ""}</div>${exitArmed ? `<button class="text-button exit-confirm" data-action="exit" aria-label="再次点击确认退出 Codex Meter">确认退出</button>` : `<button class="icon-button exit" data-action="exit" aria-label="退出 Codex Meter" title="退出 Codex Meter">${icon("exit")}</button>`}</footer>
     </section><span class="bubble-tail" aria-hidden="true"></span>
   </div>`;
   if (!changedView) {
@@ -1187,6 +1221,21 @@ async function loadMonitoring(): Promise<void> {
   }
   render();
   void updateTrayIcon(snapshot);
+  // Eliminate startup race when the scheduler already emitted before the webview registered listeners.
+  if (monitoring.antigravity && !antigravitySnapshot) {
+    try {
+      const cached = await invoke<AntigravitySnapshot | null>("cached_antigravity");
+      if (cached) {
+        applyAntigravitySnapshot(cached);
+        render();
+        void updateTrayIcon(snapshot);
+      } else {
+        void refreshAntigravity();
+      }
+    } catch {
+      void refreshAntigravity();
+    }
+  }
 }
 
 async function setMonitoring(source: UsageSource, enabled: boolean): Promise<void> {
@@ -1876,11 +1925,19 @@ window.setInterval(() => {
   const subtitle = app.querySelector<HTMLElement>(".brand-subtitle");
   if (subtitle) subtitle.textContent = headerSubtitle(freshness);
   const updated = app.querySelector<HTMLElement>(".updated span");
-  if (updated && !refreshing) {
+  if (updated && !refreshing && !antigravityRefreshing) {
     updated.textContent = footerStatusCopy(freshness);
   }
+  // Update relative timestamps in place so focus on buttons is never lost by a full DOM re-render.
   if (monitoring.antigravity && antigravitySnapshot && !settingsOpen) {
-    render();
+    const note = app.querySelector<HTMLElement>("[data-agy-note]");
+    if (note) note.textContent = antigravityFooterNote(antigravitySnapshot);
+  }
+  if (!settingsOpen) {
+    app.querySelectorAll<HTMLElement>("[data-reset-at]").forEach((element) => {
+      const unix = Number(element.dataset.resetAt);
+      if (Number.isFinite(unix)) element.textContent = formatReset(unix);
+    });
   }
 }, 30_000);
 

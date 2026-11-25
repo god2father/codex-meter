@@ -24,7 +24,7 @@ Windows 版本已验证生产构建、单实例、右键菜单、深色模式、
 - 显示 Codex 5 小时和每周用量窗口。
 - 显示本机 Claude Code 用量：当前 5 小时窗口、今日累计、当前会话和按模型汇总（主数字为输入加输出，不含缓存）。
 - 可选的 Claude 订阅额度（5 小时与每周，含 Opus/Sonnet 每周窗口）：开启后使用 Claude Code 自己的登录凭据（macOS 钥匙串项 `Claude Code-credentials`，或 `~/.claude/.credentials.json`），向 Claude Code `/usage` 使用的同一接口查询，每 5 分钟一次（面板打开时 2 分钟）。访问令牌约 3 小时过期，Meter 会按 Claude Code 相同的方式自动续期：先取得 `~/.claude/.oauth_refresh.lock` 续期锁、在锁内重新读取凭据，再写回同一钥匙串项，保留其余字段；凭据不会上传到 Anthropic 以外的地方。需要先在终端安装并登录 `claude` 命令行；网络请求遵循 macOS 系统代理。该接口未公开文档，可能变化。
-- 可选的 Antigravity 额度监测：默认关闭，开启后通过本机运行中的 Antigravity `language_server`（发现文件 `~/.gemini/antigravity/daemon/*.json`）向本地回环 ConnectRPC `GetUserStatus` 只读查询当前登录账户的剩余额度与重置时间（绕过系统代理，不触发模型推理）。支持按共享额度池分组展示（如 Gemini 共享池与 Claude / GPT 合作模型共享池）及展开查看各基础模型明细，并可作为单环托盘来源；当存在多个配额分组时，托盘单环以剩余比例最低的分组为准。
+- 可选的 Antigravity 额度监测：默认关闭，开启后通过本机运行中的 Antigravity `language_server`（发现文件 `~/.gemini/antigravity/daemon/*.json`）向本地回环 ConnectRPC `GetUserStatus` 只读查询当前登录账户的剩余额度与重置时间（绕过系统代理，不触发模型推理）。仅展示 Antigravity 自有 Gemini 模型分组及明细（自动排除第三方 Claude/GPT 模型，避免与独立卡片重复），并可作为单环托盘来源；当存在多个配额分组时，托盘单环以剩余比例最低的分组为准。
 - Codex、Claude 与 Antigravity 各有独立的监测开关，可在卡片右上角或设置页切换；关闭的来源不再刷新、不占用后台进程。Codex 默认开启，Claude 与 Antigravity 默认关闭，设置重启后保留（兼容旧版 `monitoring.json`）。
 - 主界面三张来源卡片支持按住卡片标题栏拖动排序，顺序跨重启保存，并同步到「偏好设置」中的监测列表与托盘来源选项。
 - Windows 托盘只显示方形玻璃小猫，通过表情和耳朵姿态表达用量状态。
@@ -69,11 +69,10 @@ initialize
 - 套餐类型优先采用实时 rate limits 响应，避免显示过期账户信息。
 - `resetsAt` 按 Unix 秒解析，并使用系统时区显示。
 - Token 摘要来自本机 Codex 会话文件中的独立 `token_count` 事件，通过累计值差分计算最近一轮、今日累计和当前会话。
-- Antigravity 额度来自本机运行中的 Antigravity `language_server`（`~/.gemini/antigravity/daemon/*.json`）本地回环 `POST /exa.language_server_pb.LanguageServerService/GetUserStatus`：
-  - 直接读取 `cascadeModelConfigData.clientModelConfigs[*].quotaInfo.remainingFraction`（`0.0`–`1.0`，转换为剩余百分比）与 `resetTime`（ISO-8601 UTC 时间戳，按本地时区显示）。
-  - 接口不返回窗口时长，因此不套用 Codex/Claude 的 5 小时或每周窗口与时间进度刻度；若某模型缺少 `remainingFraction`，界面显示未知（`—`），不会猜测为 `0%` 或 `100%`。
-  - 仅在同厂商大类且 `remainingFraction` 与 `resetTime` 精确一致时合并为共享额度分组，不同配额自动拆开显示，不做无依据平均。
-  - 套餐名优先取 `userTier.name` / `description`（如 `Google AI Pro`）；仅在返回明确 `creditAmount` 时显示 `AI Credits`，不混用遗留 `availablePromptCredits` 占位字段。
+- Antigravity 额度来自本机运行中的 Antigravity `language_server`（`~/.gemini/antigravity/daemon/*.json`）本地回环接口：
+  - 优先调用 `POST /exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary` 获取 Gemini 共享池的 **5 小时（`5h`）与每周（`weekly`）双窗口** `remainingFraction` 与 `resetTime`（带真实窗口时间进度刻度），并自动排除第三方 Claude/GPT 组。
+  - 同时调用 `POST /exa.language_server_pb.LanguageServerService/GetUserStatus` 获取套餐名（优先 `userTier.name` / `description`，如 `Google AI Pro`）、`AI Credits`（仅在返回明确 `creditAmount` 时显示）与各 Gemini 基础模型明细；若旧版不支持 `RetrieveUserQuotaSummary`，自动回退至 `GetUserStatus` 的共享池视图（无窗口时长时不绘制时间进度刻度）。
+  - 若某窗口或模型缺少 `remainingFraction`，界面显示未知（`—`），不会猜测为 `0%` 或 `100%`。
   - 可通过环境变量 `CODEX_METER_ANTIGRAVITY_DAEMON_DIR` 指定自定义的 daemon 发现目录。
 
 ## 隐私与安全边界

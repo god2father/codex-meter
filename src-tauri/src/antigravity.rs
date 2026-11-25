@@ -20,6 +20,8 @@ use std::{
 };
 
 const GET_USER_STATUS_PATH: &str = "/exa.language_server_pb.LanguageServerService/GetUserStatus";
+const RETRIEVE_QUOTA_SUMMARY_PATH: &str =
+    "/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_DISCOVERY_BYTES: u64 = 64 * 1024;
@@ -45,6 +47,8 @@ pub struct AntigravityQuotaGroup {
     /// Shared remaining percentage (0.0–100.0) when every model in the group reports the same value.
     pub remaining_percent: Option<f64>,
     pub used_percent: Option<f64>,
+    /// Window length in minutes when explicitly reported (e.g. 300 for 5h, 10080 for weekly).
+    pub window_duration_mins: Option<i64>,
     pub resets_at: Option<i64>,
     /// Distinct base model names in this group, in server order.
     pub models: Vec<String>,
@@ -200,11 +204,16 @@ impl AntigravityService {
         let status_code = response.status().as_u16();
         match status_code {
             200 => match response.json::<Value>() {
-                Ok(value) => EndpointOutcome::Response(parse_user_status(
-                    &value,
-                    endpoint.ls_version.clone(),
-                    unix_now(),
-                )),
+                Ok(value) => {
+                    let mut snapshot =
+                        parse_user_status(&value, endpoint.ls_version.clone(), unix_now());
+                    if snapshot.status != "signed_out" {
+                        if let Some(summary) = self.fetch_quota_summary(client, endpoint) {
+                            apply_quota_summary(&mut snapshot, &summary);
+                        }
+                    }
+                    EndpointOutcome::Response(snapshot)
+                }
                 Err(_) => EndpointOutcome::Failed(AntigravitySnapshot::with_status(
                     "error",
                     endpoint.ls_version.clone(),
@@ -250,6 +259,30 @@ impl AntigravityService {
                 ))
             }
         }
+    }
+
+    /// Reads the structured 5-hour + weekly quota summary when supported by the local server.
+    fn fetch_quota_summary(
+        &self,
+        client: &reqwest::blocking::Client,
+        endpoint: &DaemonEndpoint,
+    ) -> Option<Value> {
+        let url = format!(
+            "http://127.0.0.1:{}{RETRIEVE_QUOTA_SUMMARY_PATH}",
+            endpoint.http_port
+        );
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("x-codeium-csrf-token", &endpoint.csrf_token)
+            .json(&json!({}))
+            .send()
+            .ok()?;
+        if response.status().as_u16() != 200 {
+            return None;
+        }
+        response.json::<Value>().ok()
     }
 }
 
@@ -483,6 +516,8 @@ fn parse_user_status(
             items
                 .iter()
                 .filter_map(parse_model_entry)
+                // Claude and GPT have their own dedicated cards in Codex Meter; keep Antigravity focused on its own models.
+                .filter(|entry| entry.family != ModelFamily::Partner)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -527,6 +562,160 @@ fn parse_user_status(
         fetched_at,
         message: None,
     }
+}
+
+/// Applies the authoritative 5-hour and weekly buckets from `RetrieveUserQuotaSummary` to the
+/// snapshot, keeping only Antigravity's own (non-Claude/GPT) groups.
+fn apply_quota_summary(snapshot: &mut AntigravitySnapshot, summary: &Value) {
+    let parsed = parse_quota_summary(summary);
+    if parsed.is_empty() {
+        return;
+    }
+    let any_exhausted = parsed
+        .iter()
+        .filter_map(|group| group.remaining_percent)
+        .any(|remaining| remaining <= 0.0);
+    snapshot.groups = parsed;
+    snapshot.status = if any_exhausted {
+        "limit_reached".into()
+    } else {
+        "ok".into()
+    };
+    snapshot.message = None;
+}
+
+fn parse_quota_summary(value: &Value) -> Vec<AntigravityQuotaGroup> {
+    let Some(groups) = value
+        .pointer("/response/groups")
+        .or_else(|| value.get("groups"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    let mut non_partner_groups = Vec::new();
+    for group in groups {
+        let display_name = non_empty_str(group.get("displayName")).unwrap_or_default();
+        let buckets = group
+            .get("buckets")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if is_partner_summary_group(&display_name, buckets) {
+            continue;
+        }
+        non_partner_groups.push((display_name, group, buckets));
+    }
+
+    let multiple_groups = non_partner_groups.len() > 1;
+    let mut result = Vec::new();
+
+    for (group_idx, (display_name, group, buckets)) in non_partner_groups.into_iter().enumerate() {
+        let models = parse_models_from_description(
+            group
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        let mut parsed_buckets: Vec<(u8, AntigravityQuotaGroup)> = Vec::new();
+        for (bucket_idx, bucket) in buckets.iter().enumerate() {
+            let bucket_id = non_empty_str(bucket.get("bucketId"))
+                .unwrap_or_else(|| format!("summary-{}-{}", group_idx + 1, bucket_idx + 1));
+            let window_raw = non_empty_str(bucket.get("window")).unwrap_or_default();
+            let bucket_display = non_empty_str(bucket.get("displayName")).unwrap_or_default();
+            let (window_label, window_duration_mins, sort_rank) =
+                classify_summary_window(&window_raw, &bucket_id, &bucket_display);
+
+            let fraction = bucket
+                .get("remainingFraction")
+                .and_then(Value::as_f64)
+                .filter(|number| number.is_finite())
+                .map(|number| number.clamp(0.0, 1.0));
+            let remaining_percent = fraction.map(|value| value * 100.0);
+            let used_percent =
+                remaining_percent.map(|remaining| (100.0 - remaining).clamp(0.0, 100.0));
+            let resets_at = bucket.get("resetTime").and_then(parse_timestamp);
+            if remaining_percent.is_none() && resets_at.is_none() {
+                continue;
+            }
+
+            let label = if multiple_groups && !display_name.is_empty() {
+                format!("{display_name} · {window_label}")
+            } else {
+                window_label
+            };
+            parsed_buckets.push((
+                sort_rank,
+                AntigravityQuotaGroup {
+                    id: bucket_id,
+                    label,
+                    remaining_percent,
+                    used_percent,
+                    window_duration_mins,
+                    resets_at,
+                    models: models.clone(),
+                    model_count: models.len(),
+                },
+            ));
+        }
+        // Order shorter window (5h) before longer window (weekly) to match Codex and Claude cards.
+        parsed_buckets.sort_by_key(|(rank, _)| *rank);
+        result.extend(parsed_buckets.into_iter().map(|(_, group)| group));
+    }
+
+    result
+}
+
+fn is_partner_summary_group(display_name: &str, buckets: &[Value]) -> bool {
+    let lower = display_name.to_ascii_lowercase();
+    if lower.contains("claude") || lower.contains("gpt") || lower.contains("openai") {
+        return true;
+    }
+    !buckets.is_empty()
+        && buckets.iter().all(|bucket| {
+            bucket
+                .get("bucketId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.to_ascii_lowercase().starts_with("3p-"))
+        })
+}
+
+fn classify_summary_window(
+    window: &str,
+    bucket_id: &str,
+    display_name: &str,
+) -> (String, Option<i64>, u8) {
+    let w = window.to_ascii_lowercase();
+    let id = bucket_id.to_ascii_lowercase();
+    let name = display_name.to_ascii_lowercase();
+    if w == "5h" || id.ends_with("-5h") || name.contains("five hour") || name.contains("5-hour") {
+        return ("5 小时".into(), Some(300), 0);
+    }
+    if w == "weekly" || w == "7d" || id.ends_with("-weekly") || name.contains("weekly") {
+        return ("每周".into(), Some(10_080), 1);
+    }
+    if w == "daily" || w == "24h" || id.ends_with("-daily") {
+        return ("每日".into(), Some(1_440), 1);
+    }
+    let fallback = if !display_name.is_empty() {
+        display_name.to_owned()
+    } else if !window.is_empty() {
+        window.to_owned()
+    } else {
+        bucket_id.to_owned()
+    };
+    (fallback, None, 2)
+}
+
+fn parse_models_from_description(description: &str) -> Vec<String> {
+    let Some((_, list)) = description.split_once(':') else {
+        return Vec::new();
+    };
+    list.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 fn extract_plan(user_status: &serde_json::Map<String, Value>) -> Option<String> {
@@ -784,6 +973,7 @@ fn build_quota_groups(entries: &[RawModelEntry]) -> Vec<AntigravityQuotaGroup> {
             label,
             remaining_percent: bucket.remaining_percent,
             used_percent: bucket.used_percent,
+            window_duration_mins: None,
             resets_at: bucket.resets_at,
             models: bucket.base_models,
             model_count: bucket.raw_count,
@@ -921,13 +1111,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_shared_quota_pools_and_collapses_thinking_variants() {
+    fn parses_shared_quota_pools_and_excludes_partner_claude_and_gpt_models() {
         let snapshot = parse_user_status(&sample_response(), Some("2.34.0".into()), 1_795_528_000);
         assert_eq!(snapshot.status, "ok");
         assert_eq!(snapshot.plan.as_deref(), Some("Google AI Pro"));
         assert_eq!(snapshot.ai_credits, Some(120));
         assert_eq!(snapshot.version.as_deref(), Some("2.34.0"));
-        assert_eq!(snapshot.groups.len(), 2);
+        assert_eq!(snapshot.groups.len(), 1);
 
         let gemini = &snapshot.groups[0];
         assert_eq!(gemini.label, "Gemini");
@@ -940,18 +1130,10 @@ mod tests {
         assert_eq!(gemini.models, vec!["Gemini 4 Neon", "Gemini 3.8 Flash"]);
         assert_eq!(gemini.model_count, 3);
 
-        let partner = &snapshot.groups[1];
-        assert_eq!(partner.label, "Claude/GPT");
-        assert_eq!(partner.remaining_percent, Some(100.0));
-        assert_eq!(partner.used_percent, Some(0.0));
-        assert_eq!(
-            partner.models,
-            vec!["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"]
-        );
-
-        // Two Gemini 4 Neon thinking levels collapsed into one base model entry.
-        assert_eq!(snapshot.models.len(), 5);
+        // Two Gemini 4 Neon thinking levels collapsed into one base model entry; Claude & GPT excluded.
+        assert_eq!(snapshot.models.len(), 2);
         assert_eq!(snapshot.models[0].label, "Gemini 4 Neon");
+        assert_eq!(snapshot.models[1].label, "Gemini 3.8 Flash (High)");
     }
 
     #[test]
@@ -987,15 +1169,11 @@ mod tests {
         });
         let snapshot = parse_user_status(&payload, None, 1_000);
         assert_eq!(snapshot.status, "ok");
-        assert_eq!(snapshot.groups.len(), 4);
+        assert_eq!(snapshot.groups.len(), 2);
         assert_eq!(snapshot.groups[0].label, "Gemini 4 Pro");
         assert_eq!(snapshot.groups[0].remaining_percent, Some(40.0));
         assert_eq!(snapshot.groups[1].label, "Gemini 3.8 Flash");
         assert_eq!(snapshot.groups[1].remaining_percent, Some(90.0));
-        assert_eq!(snapshot.groups[2].label, "Claude Opus 5.5");
-        assert_eq!(snapshot.groups[2].remaining_percent, Some(20.0));
-        assert_eq!(snapshot.groups[3].label, "GPT-OSS 120B");
-        assert_eq!(snapshot.groups[3].remaining_percent, Some(75.0));
     }
 
     #[test]
@@ -1032,6 +1210,10 @@ mod tests {
                         {
                             "label": "Gemini 4 Neon (High)",
                             "quotaInfo": { "remainingFraction": -0.2, "resetTime": 1_795_000_000_000_i64 }
+                        },
+                        {
+                            "label": "Claude Opus 5.5 (High)",
+                            "quotaInfo": { "remainingFraction": 1.0, "resetTime": "2026-11-24T18:00:00Z" }
                         }
                     ]
                 }
@@ -1039,6 +1221,7 @@ mod tests {
         });
         let snapshot = parse_user_status(&exhausted, None, 1_000);
         assert_eq!(snapshot.status, "limit_reached");
+        assert_eq!(snapshot.groups.len(), 1);
         assert_eq!(snapshot.groups[0].remaining_percent, Some(0.0));
         assert_eq!(snapshot.groups[0].used_percent, Some(100.0));
         assert_eq!(snapshot.groups[0].resets_at, Some(1_795_000_000));
@@ -1053,7 +1236,7 @@ mod tests {
                             "quotaInfo": { "remainingFraction": 0.0, "resetTime": "2026-11-24T17:00:00Z" }
                         },
                         {
-                            "label": "Claude Opus 5.5 (High)",
+                            "label": "Gemini 3.8 Flash (High)",
                             "quotaInfo": { "remainingFraction": 1.4, "resetTime": "2026-11-24T18:00:00Z" }
                         }
                     ]
@@ -1090,32 +1273,28 @@ mod tests {
         );
         assert_eq!(no_quota.status, "no_data");
         assert!(no_quota.groups.is_empty());
-    }
 
-    #[test]
-    fn keeps_google_and_partner_pools_separate_even_when_both_are_full_at_same_second() {
-        let same_time = "2026-11-24T18:00:00Z";
-        let payload = json!({
-            "userStatus": {
-                "userTier": { "name": "Google AI Pro" },
-                "cascadeModelConfigData": {
-                    "clientModelConfigs": [
-                        {
-                            "label": "Gemini 4 Neon (High)",
-                            "quotaInfo": { "remainingFraction": 1.0, "resetTime": same_time }
-                        },
-                        {
-                            "label": "Claude Opus 5.5 (High)",
-                            "quotaInfo": { "remainingFraction": 1.0, "resetTime": same_time }
-                        }
-                    ]
+        // Partner-only configs should also map to no_data rather than signed_out.
+        let partner_only = parse_user_status(
+            &json!({
+                "userStatus": {
+                    "userTier": { "name": "Google AI Pro" },
+                    "cascadeModelConfigData": {
+                        "clientModelConfigs": [
+                            {
+                                "label": "Claude Opus 5.5 (High)",
+                                "quotaInfo": { "remainingFraction": 1.0, "resetTime": "2026-11-24T18:00:00Z" }
+                            }
+                        ]
+                    }
                 }
-            }
-        });
-        let snapshot = parse_user_status(&payload, None, 1_000);
-        assert_eq!(snapshot.groups.len(), 2);
-        assert_eq!(snapshot.groups[0].label, "Gemini 4 Neon");
-        assert_eq!(snapshot.groups[1].label, "Claude Opus 5.5");
+            }),
+            None,
+            1_000,
+        );
+        assert_eq!(partner_only.status, "no_data");
+        assert!(partner_only.groups.is_empty());
+        assert!(partner_only.models.is_empty());
     }
 
     #[test]
@@ -1186,6 +1365,107 @@ mod tests {
         assert_eq!(endpoints[0].http_port, 50003);
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn parses_five_hour_and_weekly_summary_windows_and_excludes_partner_group() {
+        let mut snapshot =
+            parse_user_status(&sample_response(), Some("2.34.0".into()), 1_795_528_000);
+        let summary = json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "description": "Models within this group: Gemini 4 Neon, Gemini 3.8 Flash",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 0.72,
+                                "resetTime": "2026-12-01T12:36:44Z"
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "displayName": "Five Hour Limit Remaining",
+                                "window": "5h",
+                                "remainingFraction": 0.9,
+                                "resetTime": "2026-11-25T06:15:33Z"
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "description": "Models within this group: Claude Opus 5.5, GPT-OSS 120B",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "window": "weekly",
+                                "remainingFraction": 0.5,
+                                "resetTime": "2026-12-02T01:15:45Z"
+                            },
+                            {
+                                "bucketId": "3p-5h",
+                                "window": "5h",
+                                "remainingFraction": 0.0,
+                                "resetTime": "2026-11-25T06:15:45Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        apply_quota_summary(&mut snapshot, &summary);
+        assert_eq!(snapshot.status, "ok");
+        assert_eq!(snapshot.groups.len(), 2);
+
+        // 5-hour window is ordered first, weekly second.
+        let five_h = &snapshot.groups[0];
+        assert_eq!(five_h.id, "gemini-5h");
+        assert_eq!(five_h.label, "5 小时");
+        assert_eq!(five_h.window_duration_mins, Some(300));
+        assert_eq!(five_h.remaining_percent, Some(90.0));
+        assert_eq!(five_h.models, vec!["Gemini 4 Neon", "Gemini 3.8 Flash"]);
+
+        let weekly = &snapshot.groups[1];
+        assert_eq!(weekly.id, "gemini-weekly");
+        assert_eq!(weekly.label, "每周");
+        assert_eq!(weekly.window_duration_mins, Some(10_080));
+        assert_eq!(weekly.remaining_percent, Some(72.0));
+    }
+
+    #[test]
+    fn marks_limit_reached_when_either_summary_window_is_exhausted() {
+        let mut snapshot =
+            parse_user_status(&sample_response(), Some("2.34.0".into()), 1_795_528_000);
+        let summary = json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "window": "weekly",
+                                "remainingFraction": 0.6,
+                                "resetTime": "2026-12-01T12:36:44Z"
+                            },
+                            {
+                                "bucketId": "gemini-5h",
+                                "window": "5h",
+                                "remainingFraction": 0.0,
+                                "resetTime": "2026-11-25T06:15:33Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        apply_quota_summary(&mut snapshot, &summary);
+        assert_eq!(snapshot.status, "limit_reached");
+        assert_eq!(snapshot.groups[0].remaining_percent, Some(0.0));
+        assert_eq!(snapshot.groups[1].remaining_percent, Some(60.0));
+    }
 }
 
 #[cfg(test)]
@@ -1208,8 +1488,9 @@ mod live {
         );
         for group in &snapshot.groups {
             println!(
-                "  group={} remaining={:?}% resets_at={:?} models={:?} (raw={})",
+                "  group={} window_mins={:?} remaining={:?}% resets_at={:?} models={:?} (raw={})",
                 group.label,
+                group.window_duration_mins,
                 group.remaining_percent,
                 group.resets_at,
                 group.models,

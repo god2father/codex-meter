@@ -40,6 +40,7 @@ interface AntigravityQuotaGroup {
   label: string;
   remainingPercent: number | null;
   usedPercent: number | null;
+  windowDurationMins: number | null;
   resetsAt: number | null;
   models: string[];
   modelCount: number;
@@ -227,30 +228,32 @@ const mockAntigravitySnapshot: AntigravitySnapshot = {
   version: "2.34.0",
   groups: [
     {
-      id: "group-1",
-      label: "Gemini",
-      remainingPercent: 84,
-      usedPercent: 16,
-      resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600,
+      id: "gemini-5h",
+      label: "5 小时",
+      remainingPercent: 90,
+      usedPercent: 10,
+      windowDurationMins: 300,
+      resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600,
       models: ["Gemini 4 Neon", "Gemini 4 Carbon", "Gemini 4 Argon", "Gemini 4 Hydrogen", "Gemini 3.8 Flash"],
-      modelCount: 20,
+      modelCount: 5,
     },
     {
-      id: "group-2",
-      label: "Claude/GPT",
-      remainingPercent: 100,
-      usedPercent: 0,
-      resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600,
-      models: ["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"],
-      modelCount: 7,
+      id: "gemini-weekly",
+      label: "每周",
+      remainingPercent: 72,
+      usedPercent: 28,
+      windowDurationMins: 10080,
+      resetsAt: Math.floor(Date.now() / 1000) + 6.4 * 86400,
+      models: ["Gemini 4 Neon", "Gemini 4 Carbon", "Gemini 4 Argon", "Gemini 4 Hydrogen", "Gemini 3.8 Flash"],
+      modelCount: 5,
     },
   ],
   models: [
-    { label: "Gemini 4 Neon", modelId: "gemini-4-neon-high", remainingPercent: 84, usedPercent: 16, resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600 },
-    { label: "Gemini 3.8 Flash", modelId: "gemini-3.8-flash-high", remainingPercent: 84, usedPercent: 16, resetsAt: Math.floor(Date.now() / 1000) + 3.8 * 3600 },
-    { label: "Claude Opus 5.5", modelId: "claude-opus-5-5-high", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
-    { label: "Claude Sonnet 5.5", modelId: "claude-sonnet-5-5-high", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
-    { label: "GPT-OSS 120B", modelId: "gpt-oss-120b-medium", remainingPercent: 100, usedPercent: 0, resetsAt: Math.floor(Date.now() / 1000) + 4.9 * 3600 },
+    { label: "Gemini 4 Neon", modelId: "gemini-4-neon-high", remainingPercent: 90, usedPercent: 10, resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600 },
+    { label: "Gemini 4 Carbon", modelId: "gemini-4-carbon-high", remainingPercent: 90, usedPercent: 10, resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600 },
+    { label: "Gemini 4 Argon", modelId: "gemini-4-argon-high", remainingPercent: 90, usedPercent: 10, resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600 },
+    { label: "Gemini 4 Hydrogen", modelId: "gemini-4-hydrogen-high", remainingPercent: 90, usedPercent: 10, resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600 },
+    { label: "Gemini 3.8 Flash", modelId: "gemini-3.8-flash-high", remainingPercent: 90, usedPercent: 10, resetsAt: Math.floor(Date.now() / 1000) + 4.7 * 3600 },
   ],
   fetchedAt: Math.floor(Date.now() / 1000),
   message: null,
@@ -970,9 +973,14 @@ function renderClaudeUsage(): string {
 }
 
 function antigravityFooterNote(data: AntigravitySnapshot): string {
-  return antigravityRefreshing
-    ? "正在刷新本机 Antigravity 额度…"
-    : `${formatUpdated(data.fetchedAt)} · ${data.groups.length > 1 ? `${data.groups.length} 个共享额度分组` : "共享额度分组"}`;
+  if (antigravityRefreshing) return "正在刷新本机 Antigravity 额度…";
+  const hasStructuredWindows = data.groups.some(group => group.windowDurationMins !== null);
+  const scope = hasStructuredWindows
+    ? "Gemini 共享额度"
+    : data.groups.length > 1
+      ? `${data.groups.length} 个共享额度分组`
+      : "共享额度分组";
+  return `${formatUpdated(data.fetchedAt)} · ${scope}`;
 }
 
 const ANTIGRAVITY_STATUS_HINT: Record<AntigravityStatus, string> = {
@@ -1035,8 +1043,8 @@ function renderAntigravityCard(): string {
     ${cardHead("antigravity", plan, antigravityDetailsOpen, hasModels)}
     <div class="card-quota card-quota--standalone${stale ? " is-stale" : ""}" role="group" aria-label="Antigravity 剩余额度">
       <div class="quota-grid">${data.groups.map(group => {
-        const modelsTitle = group.models.length > 1 ? `共享分组：${group.models.join("、")}` : group.label;
-        return quotaCell("Antigravity", group.label, group.remainingPercent, group.resetsAt, null, modelsTitle);
+        const modelsTitle = group.models.length > 1 ? `共享模型：${group.models.join("、")}` : group.label;
+        return quotaCell("Antigravity", group.label, group.remainingPercent, group.resetsAt, group.windowDurationMins, modelsTitle);
       }).join("")}</div>
       ${staleBanner}
     </div>
@@ -1502,9 +1510,9 @@ function antigravityTooltip(): string {
 }
 
 function shortAntigravityGroup(label: string): string {
+  if (label.includes("Flash")) return "Flash";
+  if (label.includes("Pro")) return "Pro";
   if (label.startsWith("Gemini")) return "Gem";
-  if (label.startsWith("Claude")) return "Cld";
-  if (label.startsWith("GPT")) return "GPT";
   return label.slice(0, 4);
 }
 
@@ -1529,7 +1537,11 @@ function antigravityTray(): TrayPresentation {
     .filter((group): group is AntigravityQuotaGroup & { remainingPercent: number } =>
       group.remainingPercent !== null && Number.isFinite(group.remainingPercent),
     )
-    .map(group => ({ label: group.label, remaining: clampPercent(group.remainingPercent) }));
+    .map(group => ({
+      label: group.label,
+      minutes: group.windowDurationMins,
+      remaining: clampPercent(group.remainingPercent),
+    }));
 
   if (!known.length) {
     const reason = data.message || ANTIGRAVITY_STATUS_HINT[data.status] || "暂时无法获取额度";
@@ -1540,21 +1552,31 @@ function antigravityTray(): TrayPresentation {
     };
   }
 
-  const first = known[0];
-  const tightest = known.reduce((low, item) => item.remaining < low.remaining ? item : low);
-  const lightSurface = runtimePlatform === "macos" && !themeQuery.matches;
-  const ring: TrayRing = { remaining: tightest.remaining, color: usageColor(tightest.remaining, lightSurface) };
-  const title = known.length > 1 && tightest !== first
-    ? `${shortAntigravityGroup(tightest.label)} ${tightest.remaining}%`
-    : `${tightest.remaining}%`;
-  const detail = known.map(item => `${item.label} ${item.remaining}%`).join(" · ");
+  let ring: TrayRing;
+  let title: string;
+  let detail: string;
+  let lowest: number;
+
+  if (known.every((item): item is { label: string; minutes: number; remaining: number } => item.minutes !== null && item.minutes > 0)) {
+    ({ ring, title, detail, lowest } = trayReadout(known.map(item => ({ minutes: item.minutes, remaining: item.remaining }))));
+  } else {
+    const first = known[0];
+    const tightest = known.reduce((low, item) => item.remaining < low.remaining ? item : low);
+    const lightSurface = runtimePlatform === "macos" && !themeQuery.matches;
+    ring = { remaining: tightest.remaining, color: usageColor(tightest.remaining, lightSurface) };
+    title = known.length > 1 && tightest !== first
+      ? `${shortAntigravityGroup(tightest.label)} ${tightest.remaining}%`
+      : `${tightest.remaining}%`;
+    detail = known.map(item => `${item.label} ${item.remaining}%`).join(" · ");
+    lowest = tightest.remaining;
+  }
 
   if (antigravityIsExpired(data)) {
     return { mood: "sleeping", ring, dimmed: true, alertDot: true, title, tooltip: `Antigravity 数据已过期 · ${detail}` };
   }
   const prefix = data.stale ? "Antigravity 正在重连" : "Antigravity 剩余";
   return {
-    mood: trayMood(tightest.remaining, data.status === "limit_reached"),
+    mood: trayMood(lowest, data.status === "limit_reached"),
     ring,
     dimmed: Boolean(data.stale),
     alertDot: Boolean(data.stale),
